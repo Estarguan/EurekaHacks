@@ -5631,10 +5631,24 @@ var RecorderView = class extends import_obsidian.ItemView {
     const container = this.containerEl.children[1];
     container.empty();
     container.addClass("nr-container");
+    const splash = container.createDiv("nr-splash");
+    const brainSrc = this.app.vault.adapter.getResourcePath(
+      `${this.plugin.manifest.dir}/assets/neutralBrain.png`
+    );
+    splash.createEl("img", { cls: "nr-splash-brain", attr: { src: brainSrc, draggable: "false" } });
+    splash.createEl("span", { text: "click to begin", cls: "nr-splash-prompt" });
+    splash.addEventListener("click", () => {
+      splash.addClass("nr-splash-exit");
+      splash.addEventListener("transitionend", () => splash.remove(), { once: true });
+    });
     const header = container.createDiv("nr-header");
+    const headerBrainSrc = this.app.vault.adapter.getResourcePath(
+      `${this.plugin.manifest.dir}/assets/neutralBrain.png`
+    );
+    header.createEl("img", { cls: "nr-header-brain", attr: { src: headerBrainSrc, draggable: "false" } });
     const titleRow = header.createDiv("nr-title-row");
     titleRow.createEl("span", { text: "NoteReal", cls: "nr-title" });
-    titleRow.createEl("span", { text: "Anti-AI", cls: "nr-badge" });
+    header.createEl("p", { text: "Sometimes to take two steps forward you need to take one step back.", cls: "nr-slogan" });
     const recBar = container.createDiv("nr-rec-bar");
     this.recordBtn = recBar.createEl("button", { cls: "nr-record-btn" });
     this.recordBtn.innerHTML = '<span class="nr-dot"></span> Start Recording';

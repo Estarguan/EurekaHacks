@@ -218,6 +218,10 @@ export class RecorderView extends ItemView {
 	private sidebarBodyEl!: HTMLElement;
 	private sidebarTitleEl!: HTMLElement;
 
+	// Brain state
+	private brainScore = 0;
+	private headerBrainEl!: HTMLImageElement;
+
 	constructor(leaf: WorkspaceLeaf, plugin: NoteRealPlugin) {
 		super(leaf);
 		this.plugin = plugin;
@@ -232,11 +236,27 @@ export class RecorderView extends ItemView {
 		container.empty();
 		container.addClass("nr-container");
 
+		// Splash screen
+		const splash = container.createDiv("nr-splash");
+		const brainSrc = this.app.vault.adapter.getResourcePath(
+			`${this.plugin.manifest.dir}/assets/neutralBrain.png`
+		);
+		splash.createEl("img", { cls: "nr-splash-brain", attr: { src: brainSrc, draggable: "false" } });
+		splash.createEl("span", { text: "click to begin", cls: "nr-splash-prompt" });
+		splash.addEventListener("click", () => {
+			splash.addClass("nr-splash-exit");
+			splash.addEventListener("transitionend", () => splash.remove(), { once: true });
+		});
+
 		// Header
 		const header = container.createDiv("nr-header");
+		const headerBrainSrc = this.app.vault.adapter.getResourcePath(
+			`${this.plugin.manifest.dir}/assets/neutralBrain.png`
+		);
+		this.headerBrainEl = header.createEl("img", { cls: "nr-header-brain", attr: { src: headerBrainSrc, draggable: "false" } }) as HTMLImageElement;
 		const titleRow = header.createDiv("nr-title-row");
 		titleRow.createEl("span", { text: "NoteReal", cls: "nr-title" });
-		titleRow.createEl("span", { text: "Anti-AI", cls: "nr-badge" });
+		header.createEl("p", { text: "Sometimes to take two steps forward you need to take one step back.", cls: "nr-slogan" });
 
 		// Record bar
 		const recBar = container.createDiv("nr-rec-bar");
@@ -428,6 +448,9 @@ export class RecorderView extends ItemView {
 			const count = this.feedbackItems.filter(f => f.from < f.to).length;
 			new Notice(`${count} issue${count !== 1 ? "s" : ""} highlighted — click any underlined text to see feedback.`);
 
+			if (count >= 5)      { this.brainScore--; this.updateBrainImage(); }
+			else if (count <= 2) { this.brainScore++; this.updateBrainImage(); }
+
 			const legend = this.containerEl.querySelector("#nr-legend") as HTMLElement | null;
 			if (legend) legend.style.display = "flex";
 
@@ -581,6 +604,13 @@ export class RecorderView extends ItemView {
 		} catch {
 			feedback = this.metacogSections.map(() => "Could not generate feedback.");
 		}
+
+		// Score self-awareness: count overconfident sections (user >> AI)
+		const overconfident = this.metacogSections.filter((s, i) => (this.metacogUserScores[i] - s.aiScore) > 2).length;
+		const total = this.metacogSections.length;
+		if (overconfident > total / 2)           { this.brainScore--; this.updateBrainImage(); }
+		else if (overconfident === 0 && total > 0) { this.brainScore++; this.updateBrainImage(); }
+
 		this.renderMetacognitionResults(feedback);
 	}
 
@@ -655,6 +685,15 @@ export class RecorderView extends ItemView {
 		});
 	}
 
+	private updateBrainImage() {
+		const asset = this.brainScore <= -2 ? "roastedBrain.png"
+		            : this.brainScore >= 2  ? "galaxyBrain.png"
+		            :                         "neutralBrain.png";
+		this.headerBrainEl.src = this.app.vault.adapter.getResourcePath(
+			`${this.plugin.manifest.dir}/assets/${asset}`
+		);
+	}
+
 	private async recheckAll() {
 		const studentNotes = this.cmEditor.state.doc.toString().trim();
 		const apiKey = this.plugin.settings.groqApiKey;
@@ -663,6 +702,8 @@ export class RecorderView extends ItemView {
 		this.feedbackItems    = [];
 		this.metacogSections  = [];
 		this.metacogGivenUpSections = new Set();
+		this.brainScore = 0;
+		this.updateBrainImage();
 		this.clearHighlights();
 
 		this.sidebarBodyEl.empty();

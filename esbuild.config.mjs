@@ -8,11 +8,23 @@ const VAULT_PATHS = [
   "/Users/estarguan/Documents/Eureka/.obsidian/plugins/notereal",
 ];
 
+function copyDirRecursive(src, dest) {
+  if (!fs.existsSync(src)) return;
+  fs.mkdirSync(dest, { recursive: true });
+  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    const srcPath = `${src}/${entry.name}`;
+    const destPath = `${dest}/${entry.name}`;
+    if (entry.isDirectory()) copyDirRecursive(srcPath, destPath);
+    else fs.copyFileSync(srcPath, destPath);
+  }
+}
+
 function syncToVault() {
   for (const vault of VAULT_PATHS) {
     if (fs.existsSync(vault)) {
       fs.copyFileSync("main.js", `${vault}/main.js`);
       fs.copyFileSync("styles.css", `${vault}/styles.css`);
+      copyDirRecursive("src/assets", `${vault}/assets`);
       console.log(`[sync] → ${vault}`);
     }
   }
