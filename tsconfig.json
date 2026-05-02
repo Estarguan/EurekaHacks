@@ -5,7 +5,6 @@
     "inlineSources": true,
     "module": "ESNext",
     "target": "ES2018",
-    "allowImportingTsExtensions": true,
     "moduleResolution": "bundler",
     "importHelpers": true,
     "isolatedModules": true,

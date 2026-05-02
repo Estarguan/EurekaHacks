@@ -1,9 +1,10 @@
-import { ItemView, Notice, WorkspaceLeaf } from "obsidian";
+import { ItemView, MarkdownRenderer, Notice, WorkspaceLeaf } from "obsidian";
 import { EditorView, keymap, drawSelection, placeholder } from "@codemirror/view";
 import { EditorState } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { bracketMatching, indentOnInput } from "@codemirror/language";
 import type NoteRealPlugin from "./main";
+import { transcribeAudio, generateNotes } from "./gemini";
 
 export const RECORDER_VIEW_TYPE = "notereal-recorder";
 
@@ -42,8 +43,8 @@ export class RecorderView extends ItemView {
 
 	private mediaRecorder: MediaRecorder | null = null;
 	private audioChunks: Blob[] = [];
-	private recognition: SpeechRecognition | null = null;
-	private finalTranscript = "";
+	private transcript = "";
+	private generatedMarkdown = "";
 	private timerInterval: number | null = null;
 	private seconds = 0;
 	private isRecording = false;
@@ -54,9 +55,9 @@ export class RecorderView extends ItemView {
 	private timerEl!: HTMLElement;
 	private errorEl!: HTMLElement;
 	private transcriptEl!: HTMLElement;
-	private transcriptFinalSpan!: HTMLSpanElement;
-	private transcriptInterimSpan!: HTMLSpanElement;
-	private feedbackEl!: HTMLElement;
+	private audioPlaybackEl!: HTMLElement;
+	private aiNotesEl!: HTMLElement;
+	private aiNotesStatusEl!: HTMLElement;
 	private cmEditor!: EditorView;
 	private wordCountEl!: HTMLElement;
 	private saveBtn!: HTMLButtonElement;
@@ -108,15 +109,14 @@ export class RecorderView extends ItemView {
 		const transcriptPanel = panels.createDiv("nr-panel");
 		transcriptPanel.createEl("h3", { text: "Transcript", cls: "nr-panel-title" });
 		this.transcriptEl = transcriptPanel.createDiv("nr-transcript");
+		this.transcriptEl.createEl("p", {
+			text: "Transcript will appear here after recording stops.",
+			cls: "nr-placeholder",
+		});
 
-		// Two persistent spans — final text + faint interim text.
-		// Using textContent directly (no DOM rebuild) is reliable in Electron.
-		this.transcriptFinalSpan = this.transcriptEl.createEl("span", { cls: "nr-transcript-final" });
-		this.transcriptInterimSpan = this.transcriptEl.createEl("span", { cls: "nr-interim" });
-
-		// Placeholder until recording starts
-		this.transcriptFinalSpan.textContent = "Start recording — your speech will appear here live.";
-		this.transcriptFinalSpan.addClass("nr-placeholder");
+		// Temp audio playback (hidden until recording stops)
+		this.audioPlaybackEl = transcriptPanel.createDiv("nr-audio-playback");
+		this.audioPlaybackEl.style.display = "none";
 
 		// ── Your Notes panel ──────────────────────────────────────────
 		const studentPanel = panels.createDiv("nr-panel");
@@ -146,14 +146,15 @@ export class RecorderView extends ItemView {
 		this.wordCountEl = studentPanel.createDiv("nr-wordcount");
 		this.wordCountEl.setText("0 words");
 
-		// ── Feedback panel ────────────────────────────────────────────
-		const feedbackPanel = panels.createDiv("nr-panel");
-		feedbackPanel.createEl("h3", { text: "Feedback", cls: "nr-panel-title" });
-		this.feedbackEl = feedbackPanel.createDiv("nr-feedback");
-		const feedbackPlaceholder = this.feedbackEl.createDiv("nr-feedback-placeholder");
-		feedbackPlaceholder.createEl("div", { cls: "nr-feedback-icon", text: "✦" });
-		feedbackPlaceholder.createEl("p", { text: "AI feedback on your notes" });
-		feedbackPlaceholder.createEl("span", { text: "Coming soon", cls: "nr-coming-soon" });
+		// ── AI Notes panel ────────────────────────────────────────────
+		const aiPanel = panels.createDiv("nr-panel");
+		aiPanel.createEl("h3", { text: "Lecture Notes", cls: "nr-panel-title" });
+		this.aiNotesStatusEl = aiPanel.createDiv("nr-ai-status");
+		this.aiNotesEl = aiPanel.createDiv("nr-ai-notes");
+		this.aiNotesEl.createEl("p", {
+			text: "AI-generated notes will appear here after recording stops.",
+			cls: "nr-placeholder",
+		});
 
 		// Footer
 		const footer = container.createDiv("nr-footer");
@@ -210,19 +211,21 @@ export class RecorderView extends ItemView {
 				: true as unknown as MediaTrackConstraints;
 			const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
 
-			// After first permission grant, labels become available — refresh list
 			this.populateMicList();
 			this.mediaRecorder = new MediaRecorder(stream);
 			this.audioChunks = [];
-			this.finalTranscript = "";
+			this.transcript = "";
+			this.generatedMarkdown = "";
 			this.seconds = 0;
 			this.errorEl.style.display = "none";
 			this.savedVaultPath = null;
-
-			// Clear transcript display
-			this.transcriptFinalSpan.textContent = "";
-			this.transcriptFinalSpan.removeClass("nr-placeholder");
-			this.transcriptInterimSpan.textContent = "";
+			this.audioPlaybackEl.style.display = "none";
+			this.transcriptEl.empty();
+			this.transcriptEl.createEl("p", { text: "Recording… transcript will appear when done.", cls: "nr-placeholder" });
+			this.aiNotesEl.empty();
+			this.aiNotesEl.createEl("p", { text: "AI-generated notes will appear here after recording stops.", cls: "nr-placeholder" });
+			this.aiNotesStatusEl.empty();
+			this.saveBtn.disabled = true;
 
 			this.mediaRecorder.ondataavailable = (e) => {
 				if (e.data.size > 0) this.audioChunks.push(e.data);
@@ -238,68 +241,16 @@ export class RecorderView extends ItemView {
 				this.seconds++;
 				this.timerEl.setText(this.formatTime(this.seconds));
 			}, 1000);
-
-			this.startSpeechRecognition();
 		} catch {
 			this.showError("Microphone access denied.");
 		}
 	}
 
-	private startSpeechRecognition() {
-		const win = window as Window & {
-			SpeechRecognition?: typeof SpeechRecognition;
-			webkitSpeechRecognition?: typeof SpeechRecognition;
-		};
-		const SR = win.SpeechRecognition ?? win.webkitSpeechRecognition;
-
-		if (!SR) {
-			this.showError("Speech recognition not supported — transcript unavailable.");
-			return;
-		}
-
-		this.recognition = new SR();
-		this.recognition.continuous = true;
-		this.recognition.interimResults = true;
-		this.recognition.lang = "en-US";
-
-		this.recognition.onresult = (e: SpeechRecognitionEvent) => {
-			let interim = "";
-			for (let i = e.resultIndex; i < e.results.length; i++) {
-				if (e.results[i].isFinal) {
-					this.finalTranscript += e.results[i][0].transcript + " ";
-				} else {
-					interim += e.results[i][0].transcript;
-				}
-			}
-			// Direct textContent assignment — no DOM rebuild, always reliable
-			this.transcriptFinalSpan.textContent = this.finalTranscript;
-			this.transcriptInterimSpan.textContent = interim;
-			this.transcriptEl.scrollTop = this.transcriptEl.scrollHeight;
-		};
-
-		this.recognition.onerror = (e: SpeechRecognitionErrorEvent) => {
-			// network errors are non-fatal (often a brief dropout); others are real failures
-			if (e.error !== "network") {
-				this.showError(`Speech recognition error: ${e.error}`);
-			}
-		};
-
-		this.recognition.onend = () => {
-			// Auto-restart while still recording (recognition stops after ~60s of silence)
-			if (this.isRecording) this.recognition?.start();
-		};
-
-		this.recognition.start();
-	}
-
 	private async stopRecording() {
-		// Mark stopped first so onend doesn't restart recognition
 		this.isRecording = false;
 
-		this.recognition?.stop();
-		this.recognition = null;
-
 		if (this.mediaRecorder) {
+			this.mediaRecorder.onstop = () => this.processRecording();
 			this.mediaRecorder.stop();
 			this.mediaRecorder.stream.getTracks().forEach((t) => t.stop());
 		}
@@ -311,16 +262,49 @@ export class RecorderView extends ItemView {
 		this.recordBtn.removeClass("nr-recording");
 		this.recordBtn.innerHTML = '<span class="nr-dot"></span> Start Recording';
 		this.timerEl.style.display = "none";
+	}
 
-		// Commit any remaining interim text as final
-		if (this.transcriptInterimSpan.textContent) {
-			this.finalTranscript += this.transcriptInterimSpan.textContent + " ";
-			this.transcriptFinalSpan.textContent = this.finalTranscript;
-			this.transcriptInterimSpan.textContent = "";
+	private async processRecording() {
+		const blob = new Blob(this.audioChunks, { type: "audio/webm" });
+
+		// Show audio playback
+		const url = URL.createObjectURL(blob);
+		this.audioPlaybackEl.empty();
+		this.audioPlaybackEl.createEl("p", { text: "Temp Playback", cls: "nr-playback-label" });
+		const audio = this.audioPlaybackEl.createEl("audio");
+		audio.src = url;
+		audio.controls = true;
+		this.audioPlaybackEl.style.display = "block";
+
+		const apiKey = this.plugin.settings.groqApiKey;
+		if (!apiKey) {
+			this.showError("No Groq API key. Add it in Settings → NoteReal.");
+			return;
 		}
 
-		if (this.finalTranscript.trim()) {
+		// Step 1: Transcribe
+		this.aiNotesStatusEl.setText("Transcribing…");
+		this.transcriptEl.empty();
+		try {
+			this.transcript = await transcribeAudio(blob, apiKey);
+			this.transcriptEl.setText(this.transcript);
+		} catch (e) {
+			this.showError(`Transcription failed: ${(e as Error).message}`);
+			this.aiNotesStatusEl.empty();
+			return;
+		}
+
+		// Step 2: Generate notes
+		this.aiNotesStatusEl.innerHTML = '<span class="nr-spinner"></span> Generating notes…';
+		this.aiNotesEl.empty();
+		try {
+			this.generatedMarkdown = await generateNotes(this.transcript, apiKey);
+			this.aiNotesStatusEl.empty();
+			await MarkdownRenderer.render(this.app, this.generatedMarkdown, this.aiNotesEl, "", this);
 			this.saveBtn.disabled = false;
+		} catch (e) {
+			this.showError(`Note generation failed: ${(e as Error).message}`);
+			this.aiNotesStatusEl.empty();
 		}
 	}
 
@@ -339,9 +323,15 @@ export class RecorderView extends ItemView {
 			`# ${this.savedVaultPath.split("/").pop()?.replace(".md", "") ?? "Lecture Notes"}`,
 			`*Recorded: ${now.toLocaleString()}*`,
 			"",
+			"## AI Generated Notes",
+			"",
+			this.generatedMarkdown.trim() || "*No notes generated.*",
+			"",
+			"---",
+			"",
 			"## Transcript",
 			"",
-			this.finalTranscript.trim() || "*No transcript available.*",
+			this.transcript.trim() || "*No transcript available.*",
 			"",
 			"---",
 			"",

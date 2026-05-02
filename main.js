@@ -30,6 +30,54 @@ var import_view = require("@codemirror/view");
 var import_state = require("@codemirror/state");
 var import_commands = require("@codemirror/commands");
 var import_language = require("@codemirror/language");
+
+// src/gemini.ts
+var GROQ_BASE = "https://api.groq.com/openai/v1";
+async function transcribeAudio(blob, apiKey) {
+  const form = new FormData();
+  form.append("file", blob, "recording.webm");
+  form.append("model", "whisper-large-v3-turbo");
+  const res = await fetch(`${GROQ_BASE}/audio/transcriptions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: form
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`Groq transcription ${res.status}${detail ? ": " + detail : ""}`);
+  }
+  const data = await res.json();
+  return data.text;
+}
+async function generateNotes(transcript, apiKey) {
+  const res = await fetch(`${GROQ_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "llama-3.3-70b-versatile",
+      messages: [
+        {
+          role: "user",
+          content: `You are a note-taking assistant. Convert this lecture transcript into clear, structured notes. Use markdown with headings (##), bullet points, and **bold** for key terms. Be concise \u2014 capture the key ideas, not every word.
+
+Transcript:
+${transcript}`
+        }
+      ]
+    })
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`Groq notes ${res.status}${detail ? ": " + detail : ""}`);
+  }
+  const data = await res.json();
+  return data.choices[0].message.content;
+}
+
+// src/recorder-view.ts
 var RECORDER_VIEW_TYPE = "notereal-recorder";
 var obsidianEditorTheme = import_view.EditorView.theme({
   "&": {
@@ -65,8 +113,8 @@ var RecorderView = class extends import_obsidian.ItemView {
     super(leaf);
     this.mediaRecorder = null;
     this.audioChunks = [];
-    this.recognition = null;
-    this.finalTranscript = "";
+    this.transcript = "";
+    this.generatedMarkdown = "";
     this.timerInterval = null;
     this.seconds = 0;
     this.isRecording = false;
@@ -106,10 +154,12 @@ var RecorderView = class extends import_obsidian.ItemView {
     const transcriptPanel = panels.createDiv("nr-panel");
     transcriptPanel.createEl("h3", { text: "Transcript", cls: "nr-panel-title" });
     this.transcriptEl = transcriptPanel.createDiv("nr-transcript");
-    this.transcriptFinalSpan = this.transcriptEl.createEl("span", { cls: "nr-transcript-final" });
-    this.transcriptInterimSpan = this.transcriptEl.createEl("span", { cls: "nr-interim" });
-    this.transcriptFinalSpan.textContent = "Start recording \u2014 your speech will appear here live.";
-    this.transcriptFinalSpan.addClass("nr-placeholder");
+    this.transcriptEl.createEl("p", {
+      text: "Transcript will appear here after recording stops.",
+      cls: "nr-placeholder"
+    });
+    this.audioPlaybackEl = transcriptPanel.createDiv("nr-audio-playback");
+    this.audioPlaybackEl.style.display = "none";
     const studentPanel = panels.createDiv("nr-panel");
     studentPanel.createEl("h3", { text: "Your Notes", cls: "nr-panel-title" });
     const editorEl = studentPanel.createDiv("nr-cm-editor");
@@ -134,13 +184,14 @@ var RecorderView = class extends import_obsidian.ItemView {
     });
     this.wordCountEl = studentPanel.createDiv("nr-wordcount");
     this.wordCountEl.setText("0 words");
-    const feedbackPanel = panels.createDiv("nr-panel");
-    feedbackPanel.createEl("h3", { text: "Feedback", cls: "nr-panel-title" });
-    this.feedbackEl = feedbackPanel.createDiv("nr-feedback");
-    const feedbackPlaceholder = this.feedbackEl.createDiv("nr-feedback-placeholder");
-    feedbackPlaceholder.createEl("div", { cls: "nr-feedback-icon", text: "\u2726" });
-    feedbackPlaceholder.createEl("p", { text: "AI feedback on your notes" });
-    feedbackPlaceholder.createEl("span", { text: "Coming soon", cls: "nr-coming-soon" });
+    const aiPanel = panels.createDiv("nr-panel");
+    aiPanel.createEl("h3", { text: "Lecture Notes", cls: "nr-panel-title" });
+    this.aiNotesStatusEl = aiPanel.createDiv("nr-ai-status");
+    this.aiNotesEl = aiPanel.createDiv("nr-ai-notes");
+    this.aiNotesEl.createEl("p", {
+      text: "AI-generated notes will appear here after recording stops.",
+      cls: "nr-placeholder"
+    });
     const footer = container.createDiv("nr-footer");
     this.saveBtn = footer.createEl("button", {
       text: "Save to Vault",
@@ -185,13 +236,18 @@ var RecorderView = class extends import_obsidian.ItemView {
       this.populateMicList();
       this.mediaRecorder = new MediaRecorder(stream);
       this.audioChunks = [];
-      this.finalTranscript = "";
+      this.transcript = "";
+      this.generatedMarkdown = "";
       this.seconds = 0;
       this.errorEl.style.display = "none";
       this.savedVaultPath = null;
-      this.transcriptFinalSpan.textContent = "";
-      this.transcriptFinalSpan.removeClass("nr-placeholder");
-      this.transcriptInterimSpan.textContent = "";
+      this.audioPlaybackEl.style.display = "none";
+      this.transcriptEl.empty();
+      this.transcriptEl.createEl("p", { text: "Recording\u2026 transcript will appear when done.", cls: "nr-placeholder" });
+      this.aiNotesEl.empty();
+      this.aiNotesEl.createEl("p", { text: "AI-generated notes will appear here after recording stops.", cls: "nr-placeholder" });
+      this.aiNotesStatusEl.empty();
+      this.saveBtn.disabled = true;
       this.mediaRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) this.audioChunks.push(e.data);
       };
@@ -204,53 +260,14 @@ var RecorderView = class extends import_obsidian.ItemView {
         this.seconds++;
         this.timerEl.setText(this.formatTime(this.seconds));
       }, 1e3);
-      this.startSpeechRecognition();
     } catch (e) {
       this.showError("Microphone access denied.");
     }
   }
-  startSpeechRecognition() {
-    var _a;
-    const win = window;
-    const SR = (_a = win.SpeechRecognition) != null ? _a : win.webkitSpeechRecognition;
-    if (!SR) {
-      this.showError("Speech recognition not supported \u2014 transcript unavailable.");
-      return;
-    }
-    this.recognition = new SR();
-    this.recognition.continuous = true;
-    this.recognition.interimResults = true;
-    this.recognition.lang = "en-US";
-    this.recognition.onresult = (e) => {
-      let interim = "";
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        if (e.results[i].isFinal) {
-          this.finalTranscript += e.results[i][0].transcript + " ";
-        } else {
-          interim += e.results[i][0].transcript;
-        }
-      }
-      this.transcriptFinalSpan.textContent = this.finalTranscript;
-      this.transcriptInterimSpan.textContent = interim;
-      this.transcriptEl.scrollTop = this.transcriptEl.scrollHeight;
-    };
-    this.recognition.onerror = (e) => {
-      if (e.error !== "network") {
-        this.showError(`Speech recognition error: ${e.error}`);
-      }
-    };
-    this.recognition.onend = () => {
-      var _a2;
-      if (this.isRecording) (_a2 = this.recognition) == null ? void 0 : _a2.start();
-    };
-    this.recognition.start();
-  }
   async stopRecording() {
-    var _a;
     this.isRecording = false;
-    (_a = this.recognition) == null ? void 0 : _a.stop();
-    this.recognition = null;
     if (this.mediaRecorder) {
+      this.mediaRecorder.onstop = () => this.processRecording();
       this.mediaRecorder.stop();
       this.mediaRecorder.stream.getTracks().forEach((t) => t.stop());
     }
@@ -261,13 +278,41 @@ var RecorderView = class extends import_obsidian.ItemView {
     this.recordBtn.removeClass("nr-recording");
     this.recordBtn.innerHTML = '<span class="nr-dot"></span> Start Recording';
     this.timerEl.style.display = "none";
-    if (this.transcriptInterimSpan.textContent) {
-      this.finalTranscript += this.transcriptInterimSpan.textContent + " ";
-      this.transcriptFinalSpan.textContent = this.finalTranscript;
-      this.transcriptInterimSpan.textContent = "";
+  }
+  async processRecording() {
+    const blob = new Blob(this.audioChunks, { type: "audio/webm" });
+    const url = URL.createObjectURL(blob);
+    this.audioPlaybackEl.empty();
+    this.audioPlaybackEl.createEl("p", { text: "Temp Playback", cls: "nr-playback-label" });
+    const audio = this.audioPlaybackEl.createEl("audio");
+    audio.src = url;
+    audio.controls = true;
+    this.audioPlaybackEl.style.display = "block";
+    const apiKey = this.plugin.settings.groqApiKey;
+    if (!apiKey) {
+      this.showError("No Groq API key. Add it in Settings \u2192 NoteReal.");
+      return;
     }
-    if (this.finalTranscript.trim()) {
+    this.aiNotesStatusEl.setText("Transcribing\u2026");
+    this.transcriptEl.empty();
+    try {
+      this.transcript = await transcribeAudio(blob, apiKey);
+      this.transcriptEl.setText(this.transcript);
+    } catch (e) {
+      this.showError(`Transcription failed: ${e.message}`);
+      this.aiNotesStatusEl.empty();
+      return;
+    }
+    this.aiNotesStatusEl.innerHTML = '<span class="nr-spinner"></span> Generating notes\u2026';
+    this.aiNotesEl.empty();
+    try {
+      this.generatedMarkdown = await generateNotes(this.transcript, apiKey);
+      this.aiNotesStatusEl.empty();
+      await import_obsidian.MarkdownRenderer.render(this.app, this.generatedMarkdown, this.aiNotesEl, "", this);
       this.saveBtn.disabled = false;
+    } catch (e) {
+      this.showError(`Note generation failed: ${e.message}`);
+      this.aiNotesStatusEl.empty();
     }
   }
   async saveToVault() {
@@ -284,9 +329,15 @@ var RecorderView = class extends import_obsidian.ItemView {
       `# ${(_b = (_a = this.savedVaultPath.split("/").pop()) == null ? void 0 : _a.replace(".md", "")) != null ? _b : "Lecture Notes"}`,
       `*Recorded: ${now.toLocaleString()}*`,
       "",
+      "## AI Generated Notes",
+      "",
+      this.generatedMarkdown.trim() || "*No notes generated.*",
+      "",
+      "---",
+      "",
       "## Transcript",
       "",
-      this.finalTranscript.trim() || "*No transcript available.*",
+      this.transcript.trim() || "*No transcript available.*",
       "",
       "---",
       "",
@@ -335,7 +386,7 @@ var RecorderView = class extends import_obsidian.ItemView {
 
 // src/main.ts
 var DEFAULT_SETTINGS = {
-  geminiApiKey: "",
+  groqApiKey: "",
   saveFolder: ""
 };
 var NoteRealPlugin = class extends import_obsidian2.Plugin {
@@ -380,9 +431,9 @@ var NoteRealSettingTab = class extends import_obsidian2.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian2.Setting(containerEl).setName("Gemini API key").setDesc("Free API key from aistudio.google.com").addText(
-      (text) => text.setPlaceholder("AIza...").setValue(this.plugin.settings.geminiApiKey).onChange(async (value) => {
-        this.plugin.settings.geminiApiKey = value;
+    new import_obsidian2.Setting(containerEl).setName("Groq API key").setDesc("Free API key from console.groq.com").addText(
+      (text) => text.setPlaceholder("AIza...").setValue(this.plugin.settings.groqApiKey).onChange(async (value) => {
+        this.plugin.settings.groqApiKey = value;
         await this.plugin.saveSettings();
       })
     );

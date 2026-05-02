@@ -3,12 +3,18 @@ import process from "process";
 import builtins from "builtin-modules";
 import fs from "fs";
 
-const VAULT_PLUGIN = "C:/Users/aweso/OneDrive/Desktop/EurekaHacks1/.obsidian/plugins/notereal";
+const VAULT_PATHS = [
+  "C:/Users/aweso/OneDrive/Desktop/EurekaHacks1/.obsidian/plugins/notereal",
+  "/Users/estarguan/Documents/Eureka/.obsidian/plugins/notereal",
+];
 
 function syncToVault() {
-  if (fs.existsSync(VAULT_PLUGIN)) {
-    fs.copyFileSync("main.js", `${VAULT_PLUGIN}/main.js`);
-    fs.copyFileSync("styles.css", `${VAULT_PLUGIN}/styles.css`);
+  for (const vault of VAULT_PATHS) {
+    if (fs.existsSync(vault)) {
+      fs.copyFileSync("main.js", `${vault}/main.js`);
+      fs.copyFileSync("styles.css", `${vault}/styles.css`);
+      console.log(`[sync] → ${vault}`);
+    }
   }
 }
 

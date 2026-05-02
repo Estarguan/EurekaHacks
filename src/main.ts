@@ -2,12 +2,12 @@ import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
 import { RecorderView, RECORDER_VIEW_TYPE } from "./recorder-view";
 
 export interface NoteRealSettings {
-	geminiApiKey: string;
+	groqApiKey: string;
 	saveFolder: string;
 }
 
 const DEFAULT_SETTINGS: NoteRealSettings = {
-	geminiApiKey: "",
+	groqApiKey: "",
 	saveFolder: "",
 };
 
@@ -69,14 +69,14 @@ class NoteRealSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName("Gemini API key")
-			.setDesc("Free API key from aistudio.google.com")
+			.setName("Groq API key")
+			.setDesc("Free API key from console.groq.com")
 			.addText((text) =>
 				text
 					.setPlaceholder("AIza...")
-					.setValue(this.plugin.settings.geminiApiKey)
+					.setValue(this.plugin.settings.groqApiKey)
 					.onChange(async (value) => {
-						this.plugin.settings.geminiApiKey = value;
+						this.plugin.settings.groqApiKey = value;
 						await this.plugin.saveSettings();
 					})
 			);

@@ -154,6 +154,47 @@
 	flex-shrink: 0;
 }
 
+/* Temp audio playback */
+.nr-audio-playback {
+	margin-top: 12px;
+	padding: 10px 12px;
+	border: 1px solid #854d0e;
+	border-radius: 8px;
+	background: rgba(133, 77, 14, 0.1);
+	flex-shrink: 0;
+}
+
+.nr-playback-label {
+	font-size: 0.7rem;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	color: #ca8a04;
+	margin: 0 0 8px 0;
+}
+
+.nr-audio-playback audio {
+	width: 100%;
+}
+
+/* AI Notes */
+.nr-ai-status {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 0.85rem;
+	color: var(--text-muted);
+	margin-bottom: 10px;
+	min-height: 22px;
+}
+
+.nr-ai-notes {
+	flex: 1;
+	overflow-y: auto;
+	font-size: 0.9rem;
+	line-height: 1.6;
+}
+
 /* Transcript */
 .nr-transcript {
 	flex: 1;
