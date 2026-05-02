@@ -17,5 +17,9 @@
     "esbuild": "^0.21.0",
     "obsidian": "latest",
     "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@codemirror/lang-markdown": "^6.5.0",
+    "@lezer/highlight": "^1.2.3"
   }
 }

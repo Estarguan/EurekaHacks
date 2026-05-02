@@ -2,7 +2,9 @@ import { ItemView, MarkdownRenderer, Modal, Notice, WorkspaceLeaf } from "obsidi
 import { EditorView, keymap, drawSelection, placeholder, Decoration, DecorationSet } from "@codemirror/view";
 import { EditorState, StateEffect, StateField, RangeSetBuilder } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
-import { bracketMatching, indentOnInput } from "@codemirror/language";
+import { bracketMatching, indentOnInput, syntaxHighlighting, HighlightStyle } from "@codemirror/language";
+import { markdown } from "@codemirror/lang-markdown";
+import { tags } from "@lezer/highlight";
 import type NoteRealPlugin from "./main";
 import { transcribeAudio, generateNotes, generateFeedback, generateNextHint, FeedbackItem } from "./gemini";
 import { TEST_MODE, SAMPLE_TRANSCRIPT, SAMPLE_AI_NOTES } from "./sample-data";
@@ -50,10 +52,10 @@ class FeedbackModal extends Modal {
 		contentEl.addClass("nr-feedback-modal");
 
 		const typeLabel: Record<string, string> = {
-			missing: "Missing content",
-			incorrect: "Incorrect",
-			incomplete: "Incomplete",
-			verbose: "Too verbose",
+			incomplete: "Expand this",
+			missing:    "Add this concept",
+			incorrect:  "Incorrect",
+			verbose:    "Too verbose — shorten",
 		};
 
 		contentEl.createEl("span", {
@@ -140,6 +142,26 @@ class FeedbackModal extends Modal {
 		this.contentEl.empty();
 	}
 }
+
+// ── Markdown highlight style (Obsidian-like) ─────────────────────────────────
+
+const markdownHighlight = HighlightStyle.define([
+	{ tag: tags.heading1,         class: "cm-md-h1" },
+	{ tag: tags.heading2,         class: "cm-md-h2" },
+	{ tag: tags.heading3,         class: "cm-md-h3" },
+	{ tag: tags.heading4,         class: "cm-md-h4" },
+	{ tag: tags.strong,           class: "cm-md-strong" },
+	{ tag: tags.emphasis,         class: "cm-md-em" },
+	{ tag: tags.strikethrough,    class: "cm-md-strike" },
+	{ tag: tags.monospace,        class: "cm-md-code" },
+	{ tag: tags.link,             class: "cm-md-link" },
+	{ tag: tags.url,              class: "cm-md-url" },
+	{ tag: tags.quote,            class: "cm-md-quote" },
+	{ tag: tags.list,             class: "cm-md-list" },
+	{ tag: tags.meta,             class: "cm-md-meta" },
+	{ tag: tags.processingInstruction, class: "cm-md-marker" },
+	{ tag: tags.contentSeparator, class: "cm-md-hr" },
+]);
 
 // ── Editor theme ──────────────────────────────────────────────────────────────
 
@@ -242,6 +264,8 @@ export class RecorderView extends ItemView {
 					EditorView.lineWrapping,
 					keymap.of([...defaultKeymap, ...historyKeymap]),
 					placeholder("Write your own notes here…\n\nCapture ideas in your own words."),
+					markdown(),
+					syntaxHighlighting(markdownHighlight),
 					obsidianEditorTheme,
 					highlightField,
 					EditorView.updateListener.of((update) => {
@@ -263,6 +287,22 @@ export class RecorderView extends ItemView {
 
 		this.wordCountEl = recordPane.createDiv("nr-wordcount");
 		this.wordCountEl.setText("0 words");
+
+		// Highlight legend — hidden until first feedback run
+		const legend = recordPane.createDiv("nr-legend");
+		legend.style.display = "none";
+		legend.id = "nr-legend";
+		const legendItems: [string, string][] = [
+			["expand",    "Expand"],
+			["missing",   "Add concept"],
+			["incorrect", "Incorrect"],
+			["shorten",   "Too verbose"],
+		];
+		for (const [cls, label] of legendItems) {
+			const item = legend.createDiv("nr-legend-item");
+			item.createEl("span", { cls: `nr-legend-dot nr-legend-${cls}` });
+			item.createEl("span", { text: label, cls: "nr-legend-label" });
+		}
 
 		// ── Review pane ───────────────────────────────────────────────
 		const reviewPane = container.createDiv("nr-pane");
@@ -489,6 +529,10 @@ export class RecorderView extends ItemView {
 			this.applyHighlights();
 			const count = this.feedbackItems.filter(f => f.from < f.to).length;
 			new Notice(`${count} issue${count !== 1 ? "s" : ""} highlighted — click any underlined text to see feedback.`);
+
+			// Reveal legend once feedback has run
+			const legend = this.containerEl.querySelector("#nr-legend") as HTMLElement | null;
+			if (legend) legend.style.display = "flex";
 		} catch (e) {
 			this.showError(`Feedback failed: ${(e as Error).message}`);
 		} finally {
