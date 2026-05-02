@@ -1341,7 +1341,7 @@
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   NoteReal theme — base (applies to both dark and light)
+   Did You Even Listen theme — base (applies to both dark and light)
    ═══════════════════════════════════════════════════════════════════ */
 
 .nr-container {
@@ -1470,7 +1470,7 @@
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   NoteReal dark theme — deep amethyst + mint
+   Did You Even Listen dark theme — deep amethyst + mint
    BG: #1e0a30  |  Surface: #2c1245  |  Card: #3f1a60
    Accent: #97D8B2 (mint)  |  Text: #f0ebff  |  Muted: #9b8ab0
    ═══════════════════════════════════════════════════════════════════ */
@@ -1701,7 +1701,7 @@
 .theme-dark .nr-splash-prompt { color: #5e4e72; }
 
 /* ═══════════════════════════════════════════════════════════════════
-   NoteReal light theme
+   Did You Even Listen light theme
    Base: #fafafe  |  Purple: #6d28d9  |  Blue: #0369a1
    ═══════════════════════════════════════════════════════════════════ */
 

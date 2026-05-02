@@ -1096,6 +1096,11 @@ export class RecorderView extends ItemView {
 			return;
 		}
 
+		if (this.seconds < 3) {
+			this.showError("Recording too short — please record for at least a few seconds.");
+			return;
+		}
+
 		const apiKey = this.plugin.settings.groqApiKey;
 		if (!apiKey) { this.showError("No Groq API key. Add it in Settings → Did You Even Listen."); return; }
 
@@ -1103,6 +1108,12 @@ export class RecorderView extends ItemView {
 		this.transcriptEl.empty();
 		try {
 			this.transcript = await transcribeAudio(blob, apiKey);
+			const WHISPER_HALLUCINATIONS = /^[\s.,!?]*thank you[\s.,!?]*$/i;
+			if (!this.transcript.trim() || WHISPER_HALLUCINATIONS.test(this.transcript.trim())) {
+				this.showError("No speech detected — make sure your microphone is working and try again.");
+				this.aiNotesStatusEl.empty();
+				return;
+			}
 			this.transcriptEl.setText(this.transcript);
 		} catch (e) {
 			this.showError(`Transcription failed: ${(e as Error).message}`);

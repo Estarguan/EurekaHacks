@@ -5421,7 +5421,7 @@ ${transcript}`);
 }
 
 // src/sample-data.ts
-var TEST_MODE = true;
+var TEST_MODE = false;
 var SAMPLE_TRANSCRIPT = `
 Alright everyone, settle down, let's get started. Today we're going to be talking about naming alkanes,
 which is part of our unit on organic chemistry nomenclature. This is IUPAC naming, so the International
@@ -6430,6 +6430,10 @@ var RecorderView = class extends import_obsidian.ItemView {
       this.metacogBtn.disabled = false;
       return;
     }
+    if (this.seconds < 3) {
+      this.showError("Recording too short \u2014 please record for at least a few seconds.");
+      return;
+    }
     const apiKey = this.plugin.settings.groqApiKey;
     if (!apiKey) {
       this.showError("No Groq API key. Add it in Settings \u2192 Did You Even Listen.");
@@ -6439,6 +6443,12 @@ var RecorderView = class extends import_obsidian.ItemView {
     this.transcriptEl.empty();
     try {
       this.transcript = await transcribeAudio(blob, apiKey);
+      const WHISPER_HALLUCINATIONS = /^[\s.,!?]*thank you[\s.,!?]*$/i;
+      if (!this.transcript.trim() || WHISPER_HALLUCINATIONS.test(this.transcript.trim())) {
+        this.showError("No speech detected \u2014 make sure your microphone is working and try again.");
+        this.aiNotesStatusEl.empty();
+        return;
+      }
       this.transcriptEl.setText(this.transcript);
     } catch (e) {
       this.showError(`Transcription failed: ${e.message}`);

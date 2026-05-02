@@ -3,7 +3,7 @@
 // Groq API calls for real transcription + note generation.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const TEST_MODE = true;
+export const TEST_MODE = false;
 
 export const SAMPLE_TRANSCRIPT = `
 Alright everyone, settle down, let's get started. Today we're going to be talking about naming alkanes,
