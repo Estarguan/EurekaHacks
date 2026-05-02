@@ -367,6 +367,87 @@
 	padding: 4px 0;
 }
 
+.nr-hints-container {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.nr-hint {
+	background: var(--background-secondary);
+	border-radius: 8px;
+	border: 1px solid var(--background-modifier-border);
+	overflow: hidden;
+}
+
+.nr-hint-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 8px 12px;
+}
+
+.nr-hint-label {
+	font-size: 0.75rem;
+	font-weight: 600;
+	color: var(--text-muted);
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+}
+
+.nr-hint-toggle {
+	background: none;
+	border: none;
+	color: var(--text-faint);
+	cursor: pointer;
+	font-size: 0.65rem;
+	padding: 2px 6px;
+	border-radius: 4px;
+	line-height: 1;
+	transition: background 0.15s, color 0.15s;
+}
+
+.nr-hint-toggle:hover {
+	background: var(--background-modifier-hover);
+	color: var(--text-normal);
+}
+
+.nr-hint-body {
+	padding: 0 12px 10px;
+	font-size: 0.85rem;
+	color: var(--text-normal);
+	line-height: 1.5;
+}
+
+.nr-hint-body p { margin: 0; }
+
+.nr-answer {
+	background: rgba(99,102,241,0.08);
+	border: 1px solid rgba(99,102,241,0.3);
+	border-radius: 8px;
+	padding: 12px 14px;
+	font-size: 0.85rem;
+	color: var(--text-normal);
+	line-height: 1.6;
+}
+
+.nr-giveup-btn {
+	background: none;
+	border: 1px dashed var(--background-modifier-border);
+	border-radius: 6px;
+	padding: 8px 14px;
+	color: var(--text-faint);
+	font-size: 0.8rem;
+	cursor: pointer;
+	text-align: left;
+	transition: border-color 0.15s, color 0.15s;
+}
+
+.nr-giveup-btn:hover {
+	border-color: #ef4444;
+	color: #ef4444;
+}
+
 .nr-type-badge {
 	display: inline-block;
 	font-size: 0.7rem;

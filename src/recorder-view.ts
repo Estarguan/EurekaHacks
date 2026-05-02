@@ -4,7 +4,7 @@ import { EditorState, StateEffect, StateField, RangeSetBuilder } from "@codemirr
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { bracketMatching, indentOnInput } from "@codemirror/language";
 import type NoteRealPlugin from "./main";
-import { transcribeAudio, generateNotes, generateFeedback, FeedbackItem } from "./gemini";
+import { transcribeAudio, generateNotes, generateFeedback, generateNextHint, FeedbackItem } from "./gemini";
 import { TEST_MODE, SAMPLE_TRANSCRIPT, SAMPLE_AI_NOTES } from "./sample-data";
 
 export const RECORDER_VIEW_TYPE = "notereal-recorder";
@@ -36,10 +36,12 @@ const highlightField = StateField.define<DecorationSet>({
 
 class FeedbackModal extends Modal {
 	private item: FeedbackItem;
+	private apiKey: string;
 
-	constructor(app: Parameters<typeof Modal.prototype.constructor>[0], item: FeedbackItem) {
+	constructor(app: Parameters<typeof Modal.prototype.constructor>[0], item: FeedbackItem, apiKey: string) {
 		super(app);
 		this.item = item;
+		this.apiKey = apiKey;
 	}
 
 	onOpen() {
@@ -67,16 +69,69 @@ class FeedbackModal extends Modal {
 
 		contentEl.createEl("p", { text: this.item.question, cls: "nr-feedback-question" });
 
+		const hintsContainer = contentEl.createDiv("nr-hints-container");
+		const shownHints: string[] = [];
+
 		const hintBtn = contentEl.createEl("button", {
 			text: "I'm stuck — give me a hint",
 			cls: "nr-hint-btn",
 		});
-		const hintEl = contentEl.createDiv("nr-hint");
-		hintEl.setText(this.item.hint);
-		hintEl.style.display = "none";
 
-		hintBtn.addEventListener("click", () => {
-			hintEl.style.display = "block";
+		const giveUpBtn = contentEl.createEl("button", {
+			text: "I give up — just tell me",
+			cls: "nr-giveup-btn",
+		});
+		const answerEl = contentEl.createDiv("nr-answer");
+		answerEl.setText(this.item.answer ?? "");
+		answerEl.style.display = "none";
+
+		const addHint = (text: string) => {
+			const n = shownHints.length;
+			shownHints.push(text);
+
+			const hintEl = hintsContainer.createDiv("nr-hint");
+			const headerEl = hintEl.createDiv("nr-hint-header");
+			headerEl.createEl("span", { text: `Hint ${n + 1}`, cls: "nr-hint-label" });
+			const toggleBtn = headerEl.createEl("button", { cls: "nr-hint-toggle", attr: { "aria-label": "Toggle hint" } });
+			toggleBtn.innerHTML = "▲";
+
+			const bodyEl = hintEl.createDiv("nr-hint-body");
+			bodyEl.createEl("p", { text });
+
+			let expanded = true;
+			toggleBtn.addEventListener("click", () => {
+				expanded = !expanded;
+				bodyEl.style.display = expanded ? "block" : "none";
+				toggleBtn.innerHTML = expanded ? "▲" : "▼";
+			});
+
+			hintBtn.setText("Give me another hint");
+		};
+
+		hintBtn.addEventListener("click", async () => {
+			hintBtn.disabled = true;
+			hintBtn.setText("Thinking…");
+
+			// Use pre-generated hints first, then fetch more on demand
+			const pregenerated = this.item.hints ?? [];
+			if (shownHints.length < pregenerated.length) {
+				addHint(pregenerated[shownHints.length]);
+				hintBtn.disabled = false;
+			} else {
+				try {
+					const next = await generateNextHint(this.item, shownHints, this.apiKey);
+					addHint(next);
+				} catch {
+					hintBtn.setText("Couldn't load hint — try again");
+				} finally {
+					hintBtn.disabled = false;
+				}
+			}
+		});
+
+		giveUpBtn.addEventListener("click", () => {
+			answerEl.style.display = "block";
+			giveUpBtn.style.display = "none";
 			hintBtn.style.display = "none";
 		});
 	}
@@ -450,7 +505,7 @@ export class RecorderView extends ItemView {
 	private openFeedbackPopup(id: string) {
 		const item = this.feedbackItems.find((f) => f.id === id);
 		if (!item) return;
-		new FeedbackModal(this.app, item).open();
+		new FeedbackModal(this.app, item, this.plugin.settings.groqApiKey).open();
 	}
 
 	private applyHighlights() {

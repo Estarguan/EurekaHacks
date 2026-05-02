@@ -57,7 +57,12 @@ Return ONLY a raw JSON array \u2014 no markdown fences, no explanation, just the
   {
     "studentText": "exact phrase from student notes to highlight, or empty string if content is completely missing",
     "question": "Socratic question that nudges the student toward the issue without giving the answer",
-    "hint": "More direct hint if they are stuck \u2014 still does not give the full answer away",
+    "hints": [
+      "subtle nudge \u2014 barely a hint, makes them think",
+      "more direct \u2014 points at what to look for",
+      "very specific \u2014 nearly gives it away but still makes them connect the dots"
+    ],
+    "answer": "full clear explanation of what was wrong or missing and why it matters",
     "type": "missing|incorrect|incomplete|verbose"
   }
 ]
@@ -91,6 +96,17 @@ async function groqChat(apiKey, prompt) {
   }
   const data = await res.json();
   return data.choices[0].message.content;
+}
+async function generateNextHint(item, previousHints, apiKey) {
+  return groqChat(apiKey, `A student is struggling with feedback on their notes. Generate the next progressive hint.
+
+Issue type: ${item.type}
+${item.studentText ? `Their text: "${item.studentText}"` : ""}
+Question asked: ${item.question}
+${previousHints.length > 0 ? `Previous hints already given:
+${previousHints.map((h, i) => `${i + 1}. ${h}`).join("\n")}` : ""}
+
+Write only the next hint \u2014 more direct than the previous ones but still don't give away the full answer. Return only the hint text, nothing else.`);
 }
 async function generateNotes(transcript, apiKey) {
   return groqChat(apiKey, `You are a note-taking assistant. Convert this lecture transcript into clear, structured notes. Use markdown with headings (##), bullet points, and **bold** for key terms. Be concise \u2014 capture the key ideas, not every word.
@@ -197,12 +213,13 @@ var highlightField = import_state.StateField.define({
   provide: (f) => import_view.EditorView.decorations.from(f)
 });
 var FeedbackModal = class extends import_obsidian.Modal {
-  constructor(app, item) {
+  constructor(app, item, apiKey) {
     super(app);
     this.item = item;
+    this.apiKey = apiKey;
   }
   onOpen() {
-    var _a;
+    var _a, _b;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("nr-feedback-modal");
@@ -222,15 +239,59 @@ var FeedbackModal = class extends import_obsidian.Modal {
       });
     }
     contentEl.createEl("p", { text: this.item.question, cls: "nr-feedback-question" });
+    const hintsContainer = contentEl.createDiv("nr-hints-container");
+    const shownHints = [];
     const hintBtn = contentEl.createEl("button", {
       text: "I'm stuck \u2014 give me a hint",
       cls: "nr-hint-btn"
     });
-    const hintEl = contentEl.createDiv("nr-hint");
-    hintEl.setText(this.item.hint);
-    hintEl.style.display = "none";
-    hintBtn.addEventListener("click", () => {
-      hintEl.style.display = "block";
+    const giveUpBtn = contentEl.createEl("button", {
+      text: "I give up \u2014 just tell me",
+      cls: "nr-giveup-btn"
+    });
+    const answerEl = contentEl.createDiv("nr-answer");
+    answerEl.setText((_b = this.item.answer) != null ? _b : "");
+    answerEl.style.display = "none";
+    const addHint = (text) => {
+      const n = shownHints.length;
+      shownHints.push(text);
+      const hintEl = hintsContainer.createDiv("nr-hint");
+      const headerEl = hintEl.createDiv("nr-hint-header");
+      headerEl.createEl("span", { text: `Hint ${n + 1}`, cls: "nr-hint-label" });
+      const toggleBtn = headerEl.createEl("button", { cls: "nr-hint-toggle", attr: { "aria-label": "Toggle hint" } });
+      toggleBtn.innerHTML = "\u25B2";
+      const bodyEl = hintEl.createDiv("nr-hint-body");
+      bodyEl.createEl("p", { text });
+      let expanded = true;
+      toggleBtn.addEventListener("click", () => {
+        expanded = !expanded;
+        bodyEl.style.display = expanded ? "block" : "none";
+        toggleBtn.innerHTML = expanded ? "\u25B2" : "\u25BC";
+      });
+      hintBtn.setText("Give me another hint");
+    };
+    hintBtn.addEventListener("click", async () => {
+      var _a2;
+      hintBtn.disabled = true;
+      hintBtn.setText("Thinking\u2026");
+      const pregenerated = (_a2 = this.item.hints) != null ? _a2 : [];
+      if (shownHints.length < pregenerated.length) {
+        addHint(pregenerated[shownHints.length]);
+        hintBtn.disabled = false;
+      } else {
+        try {
+          const next = await generateNextHint(this.item, shownHints, this.apiKey);
+          addHint(next);
+        } catch (e) {
+          hintBtn.setText("Couldn't load hint \u2014 try again");
+        } finally {
+          hintBtn.disabled = false;
+        }
+      }
+    });
+    giveUpBtn.addEventListener("click", () => {
+      answerEl.style.display = "block";
+      giveUpBtn.style.display = "none";
       hintBtn.style.display = "none";
     });
   }
@@ -535,7 +596,7 @@ var RecorderView = class extends import_obsidian.ItemView {
   openFeedbackPopup(id) {
     const item = this.feedbackItems.find((f) => f.id === id);
     if (!item) return;
-    new FeedbackModal(this.app, item).open();
+    new FeedbackModal(this.app, item, this.plugin.settings.groqApiKey).open();
   }
   applyHighlights() {
     const highlights = this.feedbackItems.filter((item) => item.from < item.to).map(({ from, to, id, type }) => ({ from, to, id, type }));

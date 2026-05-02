@@ -2,7 +2,8 @@ export interface FeedbackItem {
 	id: string;
 	studentText: string;
 	question: string;
-	hint: string;
+	hints: string[];   // progressive hints, subtle → direct
+	answer: string;    // full explanation revealed on give up
 	type: "missing" | "incorrect" | "incomplete" | "verbose";
 	from: number;
 	to: number;
@@ -42,7 +43,12 @@ Return ONLY a raw JSON array — no markdown fences, no explanation, just the ar
   {
     "studentText": "exact phrase from student notes to highlight, or empty string if content is completely missing",
     "question": "Socratic question that nudges the student toward the issue without giving the answer",
-    "hint": "More direct hint if they are stuck — still does not give the full answer away",
+    "hints": [
+      "subtle nudge — barely a hint, makes them think",
+      "more direct — points at what to look for",
+      "very specific — nearly gives it away but still makes them connect the dots"
+    ],
+    "answer": "full clear explanation of what was wrong or missing and why it matters",
     "type": "missing|incorrect|incomplete|verbose"
   }
 ]
@@ -78,6 +84,21 @@ async function groqChat(apiKey: string, prompt: string): Promise<string> {
 	}
 	const data = await res.json();
 	return data.choices[0].message.content as string;
+}
+
+export async function generateNextHint(
+	item: Pick<FeedbackItem, "type" | "studentText" | "question">,
+	previousHints: string[],
+	apiKey: string
+): Promise<string> {
+	return groqChat(apiKey, `A student is struggling with feedback on their notes. Generate the next progressive hint.
+
+Issue type: ${item.type}
+${item.studentText ? `Their text: "${item.studentText}"` : ""}
+Question asked: ${item.question}
+${previousHints.length > 0 ? `Previous hints already given:\n${previousHints.map((h, i) => `${i + 1}. ${h}`).join("\n")}` : ""}
+
+Write only the next hint — more direct than the previous ones but still don't give away the full answer. Return only the hint text, nothing else.`);
 }
 
 export async function generateNotes(transcript: string, apiKey: string): Promise<string> {
