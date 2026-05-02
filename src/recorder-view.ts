@@ -14,6 +14,7 @@ export const RECORDER_VIEW_TYPE = "didyouevenlisten-recorder";
 // ── CodeMirror highlight decoration ──────────────────────────────────────────
 
 const setHighlights = StateEffect.define<Array<{ from: number; to: number; id: string; type: string }>>();
+const addHighlight  = StateEffect.define<{ from: number; to: number; id: string; type: string }>();
 
 const highlightField = StateField.define<DecorationSet>({
 	create() { return Decoration.none; },
@@ -27,6 +28,12 @@ const highlightField = StateField.define<DecorationSet>({
 					builder.add(from, to, Decoration.mark({ class: `nr-highlight nr-hl-${id} nr-hl-type-${type}` }));
 				}
 				deco = builder.finish();
+			} else if (effect.is(addHighlight)) {
+				const { from, to, id, type } = effect.value;
+				deco = deco.update({
+					add: [Decoration.mark({ class: `nr-highlight nr-hl-${id} nr-hl-type-${type}` }).range(from, to)],
+					sort: true,
+				});
 			}
 		}
 		return deco;
@@ -53,6 +60,14 @@ class FeedbackModal extends Modal {
 		const { contentEl } = this;
 		contentEl.empty();
 		contentEl.addClass("nr-feedback-modal");
+
+		this.modalEl.style.opacity = "0";
+		this.modalEl.style.transform = "translateY(6px)";
+		this.modalEl.style.transition = "opacity 0.22s ease, transform 0.22s ease";
+		requestAnimationFrame(() => {
+			this.modalEl.style.opacity = "1";
+			this.modalEl.style.transform = "translateY(0)";
+		});
 
 		const typeLabel: Record<string, string> = {
 			incomplete: "Expand this",
@@ -203,6 +218,10 @@ export class RecorderView extends ItemView {
 	private metacogUserScores: number[] = [];
 	private metacogGivenUpSections: Set<number> = new Set();
 
+	private highlightTimeouts: number[] = [];
+	private errorTimeout: number | null = null;
+	private brainResetTimeout: number | null = null;
+
 	private recordBtn!: HTMLButtonElement;
 	private micSelect!: HTMLSelectElement;
 	private timerEl!: HTMLElement;
@@ -228,6 +247,8 @@ export class RecorderView extends ItemView {
 	// Brain state
 	private brainScore = 0;
 	private headerBrainEl!: HTMLImageElement;
+	private brainSpeechEl!: HTMLElement;
+	private brainSpeechTimeout: number | null = null;
 
 	// Hover tooltip
 	private tooltipEl!: HTMLElement;
@@ -274,6 +295,7 @@ export class RecorderView extends ItemView {
 			`${this.plugin.manifest.dir}/assets/neutralBrain.png`
 		);
 		this.headerBrainEl = header.createEl("img", { cls: "nr-header-brain", attr: { src: headerBrainSrc, draggable: "false" } }) as HTMLImageElement;
+		this.brainSpeechEl = header.createDiv("nr-brain-speech");
 		const titleRow = header.createDiv("nr-title-row");
 		titleRow.createEl("span", { text: "Did You Even Listen", cls: "nr-title" });
 		header.createEl("p", { text: "Sometimes to take two steps forward you need to take one step back.", cls: "nr-slogan" });
@@ -361,7 +383,7 @@ export class RecorderView extends ItemView {
 		this.cmEditor.dom.addEventListener("mouseover", (e) => {
 			const target = e.target as HTMLElement;
 			const hl = target.closest('[class*="nr-hl-f"]') as HTMLElement | null;
-			if (!hl) { this.tooltipEl.style.display = "none"; return; }
+			if (!hl) { this.tooltipEl.style.opacity = "0"; return; }
 			const cls = [...hl.classList].find(c => c.startsWith("nr-hl-f"));
 			if (!cls) return;
 			const item = this.feedbackItems.find(f => f.id === cls.replace("nr-hl-", ""));
@@ -373,10 +395,6 @@ export class RecorderView extends ItemView {
 				cls: `nr-tooltip-badge nr-type-${item.type}`,
 			});
 			this.tooltipEl.createEl("p", { text: item.question, cls: "nr-tooltip-question" });
-
-			// Measure before positioning
-			this.tooltipEl.style.visibility = "hidden";
-			this.tooltipEl.style.display = "block";
 
 			const rect  = hl.getBoundingClientRect();
 			const cRect = container.getBoundingClientRect();
@@ -391,11 +409,11 @@ export class RecorderView extends ItemView {
 
 			this.tooltipEl.style.top  = `${top}px`;
 			this.tooltipEl.style.left = `${left}px`;
-			this.tooltipEl.style.visibility = "visible";
+			this.tooltipEl.style.opacity = "1";
 		});
 
 		this.cmEditor.dom.addEventListener("mouseleave", () => {
-			this.tooltipEl.style.display = "none";
+			this.tooltipEl.style.opacity = "0";
 		});
 
 		this.wordCountEl = editorArea.createDiv("nr-wordcount");
@@ -475,7 +493,7 @@ export class RecorderView extends ItemView {
 
 		this.feedbackBtn = footer.createEl("button", { text: "Get Feedback", cls: "nr-feedback-btn" });
 		this.feedbackBtn.disabled = true;
-		this.feedbackBtn.addEventListener("click", () => this.runFeedback());
+		this.feedbackBtn.addEventListener("click", () => { this.showBrainRoast(); this.runFeedback(); });
 
 		this.metacogBtn = footer.createEl("button", { text: "🧠 Metacognition", cls: "nr-metacog-btn" });
 		this.metacogBtn.disabled = true;
@@ -548,7 +566,7 @@ export class RecorderView extends ItemView {
 				if (this.feedbackItems.length < prevCount) {
 					this.triggerBrainEvent('success', 'Nice Change!');
 				} else {
-					this.triggerBrainEvent('fail', 'YOU FAILED.');
+					this.triggerBrainEvent('fail', 'Better luck next time');
 				}
 			} else {
 				if (count >= 5)      { this.brainScore--; this.updateBrainImage(); }
@@ -590,10 +608,28 @@ export class RecorderView extends ItemView {
 	}
 
 	private applyHighlights() {
-		const highlights = this.feedbackItems
-			.filter((item) => item.from < item.to)
-			.map(({ from, to, id, type }) => ({ from, to, id, type }));
-		this.cmEditor.dispatch({ effects: setHighlights.of(highlights) });
+		this.highlightTimeouts.forEach(id => clearTimeout(id));
+		this.highlightTimeouts = [];
+		this.cmEditor.dispatch({ effects: setHighlights.of([]) });
+
+		const items = this.feedbackItems
+			.filter(item => item.from < item.to)
+			.sort((a, b) => a.from - b.from);
+
+		items.forEach(({ from, to, id, type }, i) => {
+			const tid = window.setTimeout(() => {
+				this.cmEditor.dispatch({ effects: addHighlight.of({ from, to, id, type }) });
+
+				const coords = this.cmEditor.coordsAtPos(from);
+				if (coords) {
+					const scrollEl = this.cmEditor.scrollDOM;
+					const containerRect = scrollEl.getBoundingClientRect();
+					const targetTop = scrollEl.scrollTop + (coords.top - containerRect.top) - scrollEl.clientHeight * 0.4;
+					scrollEl.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+				}
+			}, i * 700 + 100);
+			this.highlightTimeouts.push(tid);
+		});
 	}
 
 	private applyMetacogRevealedHighlights() {
@@ -608,6 +644,8 @@ export class RecorderView extends ItemView {
 	}
 
 	private clearHighlights() {
+		this.highlightTimeouts.forEach(id => clearTimeout(id));
+		this.highlightTimeouts = [];
 		this.cmEditor.dispatch({ effects: setHighlights.of([]) });
 	}
 
@@ -727,23 +765,31 @@ export class RecorderView extends ItemView {
 		compareBtn.disabled = true;
 		compareBtn.setText("Analyzing…");
 		const apiKey = this.plugin.settings.groqApiKey;
+
+		// Only compare sections the student actually wrote about
+		const coveredIndices = this.metacogSections
+			.map((s, i) => ({ s, i }))
+			.filter(({ s }) => !!s.studentExcerpt);
+		const coveredSections = coveredIndices.map(({ s }) => s);
+		const coveredScores   = coveredIndices.map(({ i }) => this.metacogUserScores[i]);
+
 		let feedback: string[];
 		try {
-			feedback = await generateComparisonFeedback(this.metacogSections, this.feedbackItems, this.metacogUserScores, apiKey);
+			feedback = await generateComparisonFeedback(coveredSections, this.feedbackItems, coveredScores, apiKey);
 		} catch {
-			feedback = this.metacogSections.map(() => "Could not generate feedback.");
+			feedback = coveredSections.map(() => "Could not generate feedback.");
 		}
 
-		// Score self-awareness: count overconfident sections (user >> AI)
-		const overconfident = this.metacogSections.filter((s, i) => (this.metacogUserScores[i] - s.aiScore) > 2).length;
-		const total = this.metacogSections.length;
+		// Score self-awareness using only covered sections
+		const overconfident = coveredSections.filter((s, i) => (coveredScores[i] - s.aiScore) > 2).length;
+		const total = coveredSections.length;
 		if (overconfident > total / 2)           { this.brainScore--; this.updateBrainImage(); }
 		else if (overconfident === 0 && total > 0) { this.brainScore++; this.updateBrainImage(); }
 
-		this.renderMetacognitionResults(feedback);
+		this.renderMetacognitionResults(coveredSections, coveredScores, feedback);
 	}
 
-	private renderMetacognitionResults(feedback: string[]) {
+	private renderMetacognitionResults(sections: MetacognitionSection[], userScores: number[], feedback: string[]) {
 		this.sidebarBodyEl.empty();
 
 		const topRow = this.sidebarBodyEl.createDiv("nr-sidebar-summary");
@@ -753,8 +799,8 @@ export class RecorderView extends ItemView {
 
 		const byId = new Map(this.feedbackItems.map(f => [f.id, f]));
 
-		this.metacogSections.forEach((section, i) => {
-			const userScore = this.metacogUserScores[i];
+		sections.forEach((section, i) => {
+			const userScore = userScores[i];
 			const aiScore   = section.aiScore;
 			const gap       = userScore - aiScore;
 			const gapClass  = gap > 2 ? "nr-gap-over" : gap < -2 ? "nr-gap-under" : "nr-gap-ok";
@@ -779,7 +825,7 @@ export class RecorderView extends ItemView {
 				});
 
 				giveUpBtn.addEventListener("click", () => {
-					this.metacogGivenUpSections.add(i);
+					this.metacogGivenUpSections.add(this.metacogSections.indexOf(section));
 					giveUpBtn.style.display = "none";
 					issuesWrap.style.display = "block";
 
@@ -815,23 +861,41 @@ export class RecorderView extends ItemView {
 		});
 	}
 
+	private setBrainAsset(asset: string, resetAfter = false) {
+		if (this.brainResetTimeout !== null) clearTimeout(this.brainResetTimeout);
+
+		this.headerBrainEl.style.opacity = "0";
+		window.setTimeout(() => {
+			this.headerBrainEl.src = this.app.vault.adapter.getResourcePath(
+				`${this.plugin.manifest.dir}/assets/${asset}`
+			);
+			this.headerBrainEl.style.opacity = "1";
+		}, 400);
+
+		if (resetAfter) {
+			this.brainResetTimeout = window.setTimeout(() => {
+				this.headerBrainEl.style.opacity = "0";
+				window.setTimeout(() => {
+					this.headerBrainEl.src = this.app.vault.adapter.getResourcePath(
+						`${this.plugin.manifest.dir}/assets/neutralBrain.png`
+					);
+					this.headerBrainEl.style.opacity = "1";
+					this.brainResetTimeout = null;
+				}, 400);
+			}, 5000);
+		}
+	}
+
 	private updateBrainImage() {
 		const asset = this.brainScore <= -2 ? "roastedBrain.png"
 		            : this.brainScore >= 2  ? "galaxyBrain.png"
 		            :                         "neutralBrain.png";
-		this.headerBrainEl.src = this.app.vault.adapter.getResourcePath(
-			`${this.plugin.manifest.dir}/assets/${asset}`
-		);
+		this.setBrainAsset(asset, asset !== "neutralBrain.png");
 	}
 
 	private triggerBrainEvent(type: 'fail' | 'success', message?: string) {
 		const asset = type === 'fail' ? 'roastedBrain.png' : 'galaxyBrain.png';
-		this.headerBrainEl.src = this.app.vault.adapter.getResourcePath(
-			`${this.plugin.manifest.dir}/assets/${asset}`
-		);
-		this.headerBrainEl.addClass('nr-brain-pop');
-		this.headerBrainEl.addEventListener('animationend', () => this.headerBrainEl.removeClass('nr-brain-pop'), { once: true });
-
+		this.setBrainAsset(asset, true);
 		const container = this.containerEl.children[1] as HTMLElement;
 		const overlay = container.createDiv(`nr-result-overlay nr-result-${type}`);
 		const brainSrc = this.app.vault.adapter.getResourcePath(
@@ -839,7 +903,7 @@ export class RecorderView extends ItemView {
 		);
 		overlay.createEl('img', { cls: 'nr-result-brain', attr: { src: brainSrc, draggable: 'false' } });
 		overlay.createEl('p', {
-			text: message ?? (type === 'fail' ? 'YOU FAILED.' : 'YOU SUCCEEDED!'),
+			text: message ?? (type === 'fail' ? 'Better luck next time' : 'YOU SUCCEEDED!'),
 			cls: 'nr-result-title',
 		});
 		overlay.createEl('p', { text: 'click to continue', cls: 'nr-result-sub' });
@@ -907,7 +971,7 @@ export class RecorderView extends ItemView {
 		if (newCount < prevCount) {
 			this.triggerBrainEvent('success', 'Nice Change!');
 		} else {
-			this.triggerBrainEvent('fail', 'YOU FAILED.');
+			this.triggerBrainEvent('fail', 'Better luck next time');
 		}
 	}
 
@@ -1163,16 +1227,12 @@ export class RecorderView extends ItemView {
 		}
 
 		const content = [
-			`# ${this.savedVaultPath.split("/").pop()?.replace(".md", "") ?? "Lecture Notes"}`,
 			`*Recorded: ${now.toLocaleString()}*`, "",
-			"## AI Generated Notes", "",
-			this.generatedMarkdown.trim() || "*No notes generated.*", "",
+			"## My Notes", "",
+			this.cmEditor.state.doc.toString().trim() || "*No notes written.*", "",
 			"---", "",
 			"## Transcript", "",
-			this.transcript.trim() || "*No transcript available.*", "",
-			"---", "",
-			"## My Notes", "",
-			this.cmEditor.state.doc.toString(),
+			this.transcript.trim() || "*No transcript available.*",
 		].join("\n");
 
 		try {
@@ -1203,8 +1263,44 @@ export class RecorderView extends ItemView {
 	}
 
 	private showError(msg: string) {
+		if (this.errorTimeout !== null) clearTimeout(this.errorTimeout);
 		this.errorEl.setText(`⚠ ${msg}`);
 		this.errorEl.style.display = "block";
+		this.errorEl.style.opacity = "1";
+		this.errorTimeout = window.setTimeout(() => {
+			this.errorEl.style.opacity = "0";
+			this.errorTimeout = window.setTimeout(() => {
+				this.errorEl.style.display = "none";
+				this.errorEl.style.opacity = "1";
+			}, 600);
+		}, 5000);
+	}
+
+	private showBrainRoast() {
+		const roasts = [
+			"Did you even listen?",
+			"I've seen better notes on a napkin.",
+			"Were you asleep? I was here the whole time.",
+			"Bold strategy, barely paying attention.",
+			"Not bad. Actually, yes. Very bad.",
+			"You had one job.",
+			"My context window outlasted your focus.",
+			"This is... a choice.",
+			"I've processed 175B parameters for this?",
+			"Spellcheck called. It's giving up.",
+			"Even the transcript is embarrassed.",
+			"Fascinating. Wrong, but fascinating.",
+		];
+		const line = roasts[Math.floor(Math.random() * roasts.length)];
+
+		if (this.brainSpeechTimeout !== null) clearTimeout(this.brainSpeechTimeout);
+		this.brainSpeechEl.setText(line);
+		this.brainSpeechEl.style.opacity = "1";
+
+		this.brainSpeechTimeout = window.setTimeout(() => {
+			this.brainSpeechEl.style.opacity = "0";
+			this.brainSpeechTimeout = null;
+		}, 4000);
 	}
 
 	private formatTime(s: number): string {

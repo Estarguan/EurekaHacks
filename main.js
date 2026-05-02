@@ -5497,6 +5497,7 @@ var SAMPLE_AI_NOTES = `
 // src/recorder-view.ts
 var RECORDER_VIEW_TYPE = "didyouevenlisten-recorder";
 var setHighlights = import_state4.StateEffect.define();
+var addHighlight = import_state4.StateEffect.define();
 var highlightField = import_state4.StateField.define({
   create() {
     return import_view4.Decoration.none;
@@ -5511,6 +5512,12 @@ var highlightField = import_state4.StateField.define({
           builder.add(from, to, import_view4.Decoration.mark({ class: `nr-highlight nr-hl-${id} nr-hl-type-${type}` }));
         }
         deco = builder.finish();
+      } else if (effect.is(addHighlight)) {
+        const { from, to, id, type } = effect.value;
+        deco = deco.update({
+          add: [import_view4.Decoration.mark({ class: `nr-highlight nr-hl-${id} nr-hl-type-${type}` }).range(from, to)],
+          sort: true
+        });
       }
     }
     return deco;
@@ -5530,6 +5537,13 @@ var FeedbackModal = class extends import_obsidian.Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("nr-feedback-modal");
+    this.modalEl.style.opacity = "0";
+    this.modalEl.style.transform = "translateY(6px)";
+    this.modalEl.style.transition = "opacity 0.22s ease, transform 0.22s ease";
+    requestAnimationFrame(() => {
+      this.modalEl.style.opacity = "1";
+      this.modalEl.style.transform = "translateY(0)";
+    });
     const typeLabel = {
       incomplete: "Expand this",
       missing: "Add this concept",
@@ -5656,8 +5670,12 @@ var RecorderView = class extends import_obsidian.ItemView {
     this.metacogSections = [];
     this.metacogUserScores = [];
     this.metacogGivenUpSections = /* @__PURE__ */ new Set();
+    this.highlightTimeouts = [];
+    this.errorTimeout = null;
+    this.brainResetTimeout = null;
     // Brain state
     this.brainScore = 0;
+    this.brainSpeechTimeout = null;
     // Snapshot of notes at last feedback run — used to gate the Re-check button
     this.prevStudentNotes = "";
     // Canonical issue set from the first feedback run; rechecks can only shrink it
@@ -5695,6 +5713,7 @@ var RecorderView = class extends import_obsidian.ItemView {
       `${this.plugin.manifest.dir}/assets/neutralBrain.png`
     );
     this.headerBrainEl = header.createEl("img", { cls: "nr-header-brain", attr: { src: headerBrainSrc, draggable: "false" } });
+    this.brainSpeechEl = header.createDiv("nr-brain-speech");
     const titleRow = header.createDiv("nr-title-row");
     titleRow.createEl("span", { text: "Did You Even Listen", cls: "nr-title" });
     header.createEl("p", { text: "Sometimes to take two steps forward you need to take one step back.", cls: "nr-slogan" });
@@ -5765,7 +5784,7 @@ var RecorderView = class extends import_obsidian.ItemView {
       const target = e.target;
       const hl = target.closest('[class*="nr-hl-f"]');
       if (!hl) {
-        this.tooltipEl.style.display = "none";
+        this.tooltipEl.style.opacity = "0";
         return;
       }
       const cls = [...hl.classList].find((c) => c.startsWith("nr-hl-f"));
@@ -5778,8 +5797,6 @@ var RecorderView = class extends import_obsidian.ItemView {
         cls: `nr-tooltip-badge nr-type-${item.type}`
       });
       this.tooltipEl.createEl("p", { text: item.question, cls: "nr-tooltip-question" });
-      this.tooltipEl.style.visibility = "hidden";
-      this.tooltipEl.style.display = "block";
       const rect = hl.getBoundingClientRect();
       const cRect = container.getBoundingClientRect();
       const tw = this.tooltipEl.offsetWidth;
@@ -5790,10 +5807,10 @@ var RecorderView = class extends import_obsidian.ItemView {
       left = Math.min(Math.max(4, left), cRect.width - tw - 4);
       this.tooltipEl.style.top = `${top}px`;
       this.tooltipEl.style.left = `${left}px`;
-      this.tooltipEl.style.visibility = "visible";
+      this.tooltipEl.style.opacity = "1";
     });
     this.cmEditor.dom.addEventListener("mouseleave", () => {
-      this.tooltipEl.style.display = "none";
+      this.tooltipEl.style.opacity = "0";
     });
     this.wordCountEl = editorArea.createDiv("nr-wordcount");
     this.wordCountEl.setText("0 words");
@@ -5854,7 +5871,10 @@ var RecorderView = class extends import_obsidian.ItemView {
     this.saveBtn.addEventListener("click", () => this.saveToVault());
     this.feedbackBtn = footer.createEl("button", { text: "Get Feedback", cls: "nr-feedback-btn" });
     this.feedbackBtn.disabled = true;
-    this.feedbackBtn.addEventListener("click", () => this.runFeedback());
+    this.feedbackBtn.addEventListener("click", () => {
+      this.showBrainRoast();
+      this.runFeedback();
+    });
     this.metacogBtn = footer.createEl("button", { text: "\u{1F9E0} Metacognition", cls: "nr-metacog-btn" });
     this.metacogBtn.disabled = true;
     this.metacogBtn.addEventListener("click", () => {
@@ -5930,7 +5950,7 @@ var RecorderView = class extends import_obsidian.ItemView {
         if (this.feedbackItems.length < prevCount) {
           this.triggerBrainEvent("success", "Nice Change!");
         } else {
-          this.triggerBrainEvent("fail", "YOU FAILED.");
+          this.triggerBrainEvent("fail", "Better luck next time");
         }
       } else {
         if (count2 >= 5) {
@@ -5971,8 +5991,23 @@ var RecorderView = class extends import_obsidian.ItemView {
     new FeedbackModal(this.app, item, this.plugin.settings.groqApiKey, () => this.triggerBrainEvent("fail")).open();
   }
   applyHighlights() {
-    const highlights = this.feedbackItems.filter((item) => item.from < item.to).map(({ from, to, id, type }) => ({ from, to, id, type }));
-    this.cmEditor.dispatch({ effects: setHighlights.of(highlights) });
+    this.highlightTimeouts.forEach((id) => clearTimeout(id));
+    this.highlightTimeouts = [];
+    this.cmEditor.dispatch({ effects: setHighlights.of([]) });
+    const items = this.feedbackItems.filter((item) => item.from < item.to).sort((a, b) => a.from - b.from);
+    items.forEach(({ from, to, id, type }, i) => {
+      const tid = window.setTimeout(() => {
+        this.cmEditor.dispatch({ effects: addHighlight.of({ from, to, id, type }) });
+        const coords = this.cmEditor.coordsAtPos(from);
+        if (coords) {
+          const scrollEl = this.cmEditor.scrollDOM;
+          const containerRect = scrollEl.getBoundingClientRect();
+          const targetTop = scrollEl.scrollTop + (coords.top - containerRect.top) - scrollEl.clientHeight * 0.4;
+          scrollEl.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
+        }
+      }, i * 700 + 100);
+      this.highlightTimeouts.push(tid);
+    });
   }
   applyMetacogRevealedHighlights() {
     const revealedIds = /* @__PURE__ */ new Set();
@@ -5983,6 +6018,8 @@ var RecorderView = class extends import_obsidian.ItemView {
     this.cmEditor.dispatch({ effects: setHighlights.of(highlights) });
   }
   clearHighlights() {
+    this.highlightTimeouts.forEach((id) => clearTimeout(id));
+    this.highlightTimeouts = [];
     this.cmEditor.dispatch({ effects: setHighlights.of([]) });
   }
   // ── Metacognition mode (sidebar) ──────────────────────────────────────────
@@ -6094,14 +6131,17 @@ var RecorderView = class extends import_obsidian.ItemView {
     compareBtn.disabled = true;
     compareBtn.setText("Analyzing\u2026");
     const apiKey = this.plugin.settings.groqApiKey;
+    const coveredIndices = this.metacogSections.map((s, i) => ({ s, i })).filter(({ s }) => !!s.studentExcerpt);
+    const coveredSections = coveredIndices.map(({ s }) => s);
+    const coveredScores = coveredIndices.map(({ i }) => this.metacogUserScores[i]);
     let feedback;
     try {
-      feedback = await generateComparisonFeedback(this.metacogSections, this.feedbackItems, this.metacogUserScores, apiKey);
+      feedback = await generateComparisonFeedback(coveredSections, this.feedbackItems, coveredScores, apiKey);
     } catch (e) {
-      feedback = this.metacogSections.map(() => "Could not generate feedback.");
+      feedback = coveredSections.map(() => "Could not generate feedback.");
     }
-    const overconfident = this.metacogSections.filter((s, i) => this.metacogUserScores[i] - s.aiScore > 2).length;
-    const total = this.metacogSections.length;
+    const overconfident = coveredSections.filter((s, i) => coveredScores[i] - s.aiScore > 2).length;
+    const total = coveredSections.length;
     if (overconfident > total / 2) {
       this.brainScore--;
       this.updateBrainImage();
@@ -6109,18 +6149,18 @@ var RecorderView = class extends import_obsidian.ItemView {
       this.brainScore++;
       this.updateBrainImage();
     }
-    this.renderMetacognitionResults(feedback);
+    this.renderMetacognitionResults(coveredSections, coveredScores, feedback);
   }
-  renderMetacognitionResults(feedback) {
+  renderMetacognitionResults(sections, userScores, feedback) {
     this.sidebarBodyEl.empty();
     const topRow = this.sidebarBodyEl.createDiv("nr-sidebar-summary");
     topRow.createEl("span", { text: "Self-assessment vs AI", cls: "nr-sidebar-count" });
     const recheckBtn = topRow.createEl("button", { text: "\u21BB Recheck", cls: "nr-sidebar-recheck-btn" });
     recheckBtn.addEventListener("click", () => this.recheckAll());
     const byId = new Map(this.feedbackItems.map((f) => [f.id, f]));
-    this.metacogSections.forEach((section, i) => {
+    sections.forEach((section, i) => {
       var _a;
-      const userScore = this.metacogUserScores[i];
+      const userScore = userScores[i];
       const aiScore = section.aiScore;
       const gap = userScore - aiScore;
       const gapClass = gap > 2 ? "nr-gap-over" : gap < -2 ? "nr-gap-under" : "nr-gap-ok";
@@ -6139,7 +6179,7 @@ var RecorderView = class extends import_obsidian.ItemView {
           cls: "nr-giveup-btn"
         });
         giveUpBtn.addEventListener("click", () => {
-          this.metacogGivenUpSections.add(i);
+          this.metacogGivenUpSections.add(this.metacogSections.indexOf(section));
           giveUpBtn.style.display = "none";
           issuesWrap.style.display = "block";
           this.applyMetacogRevealedHighlights();
@@ -6171,19 +6211,35 @@ var RecorderView = class extends import_obsidian.ItemView {
       }
     });
   }
+  setBrainAsset(asset, resetAfter = false) {
+    if (this.brainResetTimeout !== null) clearTimeout(this.brainResetTimeout);
+    this.headerBrainEl.style.opacity = "0";
+    window.setTimeout(() => {
+      this.headerBrainEl.src = this.app.vault.adapter.getResourcePath(
+        `${this.plugin.manifest.dir}/assets/${asset}`
+      );
+      this.headerBrainEl.style.opacity = "1";
+    }, 400);
+    if (resetAfter) {
+      this.brainResetTimeout = window.setTimeout(() => {
+        this.headerBrainEl.style.opacity = "0";
+        window.setTimeout(() => {
+          this.headerBrainEl.src = this.app.vault.adapter.getResourcePath(
+            `${this.plugin.manifest.dir}/assets/neutralBrain.png`
+          );
+          this.headerBrainEl.style.opacity = "1";
+          this.brainResetTimeout = null;
+        }, 400);
+      }, 5e3);
+    }
+  }
   updateBrainImage() {
     const asset = this.brainScore <= -2 ? "roastedBrain.png" : this.brainScore >= 2 ? "galaxyBrain.png" : "neutralBrain.png";
-    this.headerBrainEl.src = this.app.vault.adapter.getResourcePath(
-      `${this.plugin.manifest.dir}/assets/${asset}`
-    );
+    this.setBrainAsset(asset, asset !== "neutralBrain.png");
   }
   triggerBrainEvent(type, message) {
     const asset = type === "fail" ? "roastedBrain.png" : "galaxyBrain.png";
-    this.headerBrainEl.src = this.app.vault.adapter.getResourcePath(
-      `${this.plugin.manifest.dir}/assets/${asset}`
-    );
-    this.headerBrainEl.addClass("nr-brain-pop");
-    this.headerBrainEl.addEventListener("animationend", () => this.headerBrainEl.removeClass("nr-brain-pop"), { once: true });
+    this.setBrainAsset(asset, true);
     const container = this.containerEl.children[1];
     const overlay = container.createDiv(`nr-result-overlay nr-result-${type}`);
     const brainSrc = this.app.vault.adapter.getResourcePath(
@@ -6191,7 +6247,7 @@ var RecorderView = class extends import_obsidian.ItemView {
     );
     overlay.createEl("img", { cls: "nr-result-brain", attr: { src: brainSrc, draggable: "false" } });
     overlay.createEl("p", {
-      text: message != null ? message : type === "fail" ? "YOU FAILED." : "YOU SUCCEEDED!",
+      text: message != null ? message : type === "fail" ? "Better luck next time" : "YOU SUCCEEDED!",
       cls: "nr-result-title"
     });
     overlay.createEl("p", { text: "click to continue", cls: "nr-result-sub" });
@@ -6256,7 +6312,7 @@ var RecorderView = class extends import_obsidian.ItemView {
     if (newCount < prevCount) {
       this.triggerBrainEvent("success", "Nice Change!");
     } else {
-      this.triggerBrainEvent("fail", "YOU FAILED.");
+      this.triggerBrainEvent("fail", "Better luck next time");
     }
   }
   closeSidebar() {
@@ -6485,7 +6541,6 @@ var RecorderView = class extends import_obsidian.ItemView {
   }
   // ── Save ──────────────────────────────────────────────────────────────────
   async saveToVault() {
-    var _a, _b;
     const now = /* @__PURE__ */ new Date();
     const dateStr = now.toISOString().split("T")[0];
     const timeStr = now.toTimeString().slice(0, 5).replace(":", "-");
@@ -6495,24 +6550,17 @@ var RecorderView = class extends import_obsidian.ItemView {
       this.savedVaultPath = folder ? `${folder}/${baseName}.md` : `${baseName}.md`;
     }
     const content = [
-      `# ${(_b = (_a = this.savedVaultPath.split("/").pop()) == null ? void 0 : _a.replace(".md", "")) != null ? _b : "Lecture Notes"}`,
       `*Recorded: ${now.toLocaleString()}*`,
       "",
-      "## AI Generated Notes",
+      "## My Notes",
       "",
-      this.generatedMarkdown.trim() || "*No notes generated.*",
+      this.cmEditor.state.doc.toString().trim() || "*No notes written.*",
       "",
       "---",
       "",
       "## Transcript",
       "",
-      this.transcript.trim() || "*No transcript available.*",
-      "",
-      "---",
-      "",
-      "## My Notes",
-      "",
-      this.cmEditor.state.doc.toString()
+      this.transcript.trim() || "*No transcript available.*"
     ].join("\n");
     try {
       if (folder && !await this.app.vault.adapter.exists(folder)) await this.app.vault.createFolder(folder);
@@ -6539,8 +6587,41 @@ var RecorderView = class extends import_obsidian.ItemView {
     this.wordCountEl.setText(`${count2} ${count2 === 1 ? "word" : "words"}`);
   }
   showError(msg) {
+    if (this.errorTimeout !== null) clearTimeout(this.errorTimeout);
     this.errorEl.setText(`\u26A0 ${msg}`);
     this.errorEl.style.display = "block";
+    this.errorEl.style.opacity = "1";
+    this.errorTimeout = window.setTimeout(() => {
+      this.errorEl.style.opacity = "0";
+      this.errorTimeout = window.setTimeout(() => {
+        this.errorEl.style.display = "none";
+        this.errorEl.style.opacity = "1";
+      }, 600);
+    }, 5e3);
+  }
+  showBrainRoast() {
+    const roasts = [
+      "Did you even listen?",
+      "I've seen better notes on a napkin.",
+      "Were you asleep? I was here the whole time.",
+      "Bold strategy, barely paying attention.",
+      "Not bad. Actually, yes. Very bad.",
+      "You had one job.",
+      "My context window outlasted your focus.",
+      "This is... a choice.",
+      "I've processed 175B parameters for this?",
+      "Spellcheck called. It's giving up.",
+      "Even the transcript is embarrassed.",
+      "Fascinating. Wrong, but fascinating."
+    ];
+    const line = roasts[Math.floor(Math.random() * roasts.length)];
+    if (this.brainSpeechTimeout !== null) clearTimeout(this.brainSpeechTimeout);
+    this.brainSpeechEl.setText(line);
+    this.brainSpeechEl.style.opacity = "1";
+    this.brainSpeechTimeout = window.setTimeout(() => {
+      this.brainSpeechEl.style.opacity = "0";
+      this.brainSpeechTimeout = null;
+    }, 4e3);
   }
   formatTime(s) {
     const m = String(Math.floor(s / 60)).padStart(2, "0");
