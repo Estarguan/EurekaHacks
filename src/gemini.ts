@@ -43,6 +43,46 @@ export async function generateFeedback(
 	return [...confusionItems, ...knowledgeItems];
 }
 
+export async function filterResolvedFeedback(
+	originalItems: FeedbackItem[],
+	updatedNotes: string,
+	apiKey: string
+): Promise<string[]> {
+	if (originalItems.length === 0) return [];
+
+	const itemSummary = originalItems.map(f => ({
+		id: f.id,
+		type: f.type,
+		studentText: f.studentText || "",
+		question: f.question,
+		answer: f.answer,
+	}));
+
+	const text = await groqChat(apiKey, `Review these feedback issues against updated student notes. Determine which are STILL present and unresolved.
+
+Original issues:
+${JSON.stringify(itemSummary, null, 2)}
+
+Updated student notes:
+${updatedNotes}
+
+For each issue decide:
+- "missing": has the student now added this concept? If yes → resolved.
+- "incorrect": is the incorrect statement gone or corrected? If yes → resolved.
+- "incomplete": is it now explained sufficiently? If yes → resolved.
+- "verbose": has the verbose passage been meaningfully shortened? If yes → resolved.
+- "unclear": has the unclear passage been rewritten clearly? If yes → resolved.
+
+Return ONLY a raw JSON array of IDs that are STILL UNRESOLVED. Do not include IDs that have been fixed.
+["f0", "f2", ...]
+
+If all issues are resolved, return [].`);
+
+	const clean = text.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
+	try { return JSON.parse(clean) as string[]; }
+	catch { return originalItems.map(f => f.id); } // safe fallback: assume nothing resolved
+}
+
 export async function recheckFeedback(
 	prevNotes: string,
 	currNotes: string,

@@ -6,7 +6,7 @@ import { bracketMatching, indentOnInput, syntaxHighlighting, HighlightStyle } fr
 import { markdown } from "@codemirror/lang-markdown";
 import { tags } from "@lezer/highlight";
 import type DidYouEvenListenPlugin from "./main";
-import { transcribeAudio, generateNotes, generateFeedback, recheckFeedback, generateNextHint, generateQuizQuestions, evaluateAnswer, groupFeedbackIntoSections, generateComparisonFeedback, FeedbackItem, QuizQuestion, MetacognitionSection } from "./gemini";
+import { transcribeAudio, generateNotes, generateFeedback, filterResolvedFeedback, generateNextHint, generateQuizQuestions, evaluateAnswer, groupFeedbackIntoSections, generateComparisonFeedback, FeedbackItem, QuizQuestion, MetacognitionSection } from "./gemini";
 import { TEST_MODE, SAMPLE_TRANSCRIPT, SAMPLE_AI_NOTES } from "./sample-data";
 
 export const RECORDER_VIEW_TYPE = "didyouevenlisten-recorder";
@@ -232,8 +232,10 @@ export class RecorderView extends ItemView {
 	// Hover tooltip
 	private tooltipEl!: HTMLElement;
 
-	// Snapshot of notes at last feedback run — used for recheck diffing
+	// Snapshot of notes at last feedback run — used to gate the Re-check button
 	private prevStudentNotes = "";
+	// Canonical issue set from the first feedback run; rechecks can only shrink it
+	private initialFeedbackItems: FeedbackItem[] = [];
 
 	constructor(leaf: WorkspaceLeaf, plugin: DidYouEvenListenPlugin) {
 		super(leaf);
@@ -328,7 +330,10 @@ export class RecorderView extends ItemView {
 					obsidianEditorTheme,
 					highlightField,
 					EditorView.updateListener.of((update) => {
-						if (update.docChanged) this.updateWordCount();
+						if (update.docChanged) {
+							this.updateWordCount();
+							this.updateRecheckButtonState();
+						}
 					}),
 				],
 			}),
@@ -495,34 +500,49 @@ export class RecorderView extends ItemView {
 		if (!apiKey) { this.showError("No Groq API key. Add it in Settings → Did You Even Listen."); return; }
 
 		const prevCount = this.feedbackItems.length;
-		const isRecheck = this.prevStudentNotes !== "";
+		const isRecheck = this.initialFeedbackItems.length > 0;
 		this.feedbackBtn.disabled = true;
 		this.feedbackBtn.setText("Analyzing…");
 		this.clearHighlights();
-		// Invalidate cached sections since feedback items are changing
 		this.metacogSections = [];
 		this.metacogGivenUpSections = new Set();
 
+		let succeeded = false;
 		try {
-			const raw = isRecheck
-				? await recheckFeedback(this.prevStudentNotes, studentNotes, this.generatedMarkdown, apiKey)
-				: await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
-
-			this.feedbackItems = raw.map((item, i) => {
-				const id = `f${i}`;
-				let from = 0, to = 0;
-				if (item.studentText) {
-					const idx = studentNotes.indexOf(item.studentText);
-					if (idx !== -1) { from = idx; to = idx + item.studentText.length; }
-				}
-				return { ...item, id, from, to };
-			});
+			if (isRecheck) {
+				// Never introduce new issues — only determine which original ones are still unresolved
+				const unresolvedIds = await filterResolvedFeedback(this.initialFeedbackItems, studentNotes, apiKey);
+				const unresolvedSet = new Set(unresolvedIds);
+				this.feedbackItems = this.initialFeedbackItems
+					.filter(item => unresolvedSet.has(item.id))
+					.map(item => {
+						let from = 0, to = 0;
+						if (item.studentText) {
+							const idx = studentNotes.indexOf(item.studentText);
+							if (idx !== -1) { from = idx; to = idx + item.studentText.length; }
+						}
+						return { ...item, from, to };
+					});
+			} else {
+				const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
+				this.feedbackItems = raw.map((item, i) => {
+					const id = `f${i}`;
+					let from = 0, to = 0;
+					if (item.studentText) {
+						const idx = studentNotes.indexOf(item.studentText);
+						if (idx !== -1) { from = idx; to = idx + item.studentText.length; }
+					}
+					return { ...item, id, from, to };
+				});
+				// Store as the canonical set — rechecks can only remove items, never add
+				this.initialFeedbackItems = [...this.feedbackItems];
+			}
 
 			this.prevStudentNotes = studentNotes;
+			succeeded = true;
 
 			this.applyHighlights();
 			const count = this.feedbackItems.filter(f => f.from < f.to).length;
-			new Notice(`${count} issue${count !== 1 ? "s" : ""} highlighted — click any underlined text to see feedback.`);
 
 			if (isRecheck) {
 				if (this.feedbackItems.length < prevCount) {
@@ -538,7 +558,6 @@ export class RecorderView extends ItemView {
 			const legend = this.containerEl.querySelector("#nr-legend") as HTMLElement | null;
 			if (legend) legend.style.display = "flex";
 
-			// If metacognition sidebar is open, refresh it with new data
 			if (this.mode === "metacognition") {
 				this.sidebarBodyEl.empty();
 				this.sidebarBodyEl.innerHTML = '<div class="nr-sidebar-loading"><span class="nr-spinner"></span><p>Regrouping sections…</p></div>';
@@ -547,9 +566,21 @@ export class RecorderView extends ItemView {
 		} catch (e) {
 			this.showError(`Feedback failed: ${(e as Error).message}`);
 		} finally {
-			this.feedbackBtn.disabled = false;
-			this.feedbackBtn.setText("Re-check");
+			if (succeeded) {
+				// Keep disabled — Re-check is only available after the student edits their notes
+				this.feedbackBtn.disabled = true;
+				this.feedbackBtn.setText("Re-check");
+			} else {
+				this.feedbackBtn.disabled = false;
+				this.feedbackBtn.setText(isRecheck ? "Re-check" : "Get Feedback");
+			}
 		}
+	}
+
+	private updateRecheckButtonState() {
+		if (this.prevStudentNotes === "") return; // no feedback run yet; button managed elsewhere
+		const current = this.cmEditor.state.doc.toString().trim();
+		this.feedbackBtn.disabled = !current || current === this.prevStudentNotes;
 	}
 
 	private openFeedbackPopup(id: string) {
@@ -613,6 +644,8 @@ export class RecorderView extends ItemView {
 					}
 					return { ...item, id, from, to };
 				});
+				this.initialFeedbackItems = [...this.feedbackItems];
+				this.prevStudentNotes = studentNotes;
 			} catch (e) {
 				this.sidebarBodyEl.empty();
 				this.sidebarBodyEl.createEl("p", { text: `Analysis failed: ${(e as Error).message}`, cls: "nr-sidebar-error" });
@@ -827,7 +860,6 @@ export class RecorderView extends ItemView {
 		if (!studentNotes || !apiKey) return;
 
 		const prevCount = this.feedbackItems.length;
-		this.feedbackItems    = [];
 		this.metacogSections  = [];
 		this.metacogGivenUpSections = new Set();
 		this.brainScore = 0;
@@ -838,18 +870,32 @@ export class RecorderView extends ItemView {
 		this.sidebarBodyEl.innerHTML = '<div class="nr-sidebar-loading"><span class="nr-spinner"></span><p>Running feedback analysis…</p></div>';
 
 		try {
-			const raw = this.prevStudentNotes
-				? await recheckFeedback(this.prevStudentNotes, studentNotes, this.generatedMarkdown, apiKey)
-				: await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
-			this.feedbackItems = raw.map((item, i) => {
-				const id = `f${i}`;
-				let from = 0, to = 0;
-				if (item.studentText) {
-					const idx = studentNotes.indexOf(item.studentText);
-					if (idx !== -1) { from = idx; to = idx + item.studentText.length; }
-				}
-				return { ...item, id, from, to };
-			});
+			if (this.initialFeedbackItems.length > 0) {
+				const unresolvedIds = await filterResolvedFeedback(this.initialFeedbackItems, studentNotes, apiKey);
+				const unresolvedSet = new Set(unresolvedIds);
+				this.feedbackItems = this.initialFeedbackItems
+					.filter(item => unresolvedSet.has(item.id))
+					.map(item => {
+						let from = 0, to = 0;
+						if (item.studentText) {
+							const idx = studentNotes.indexOf(item.studentText);
+							if (idx !== -1) { from = idx; to = idx + item.studentText.length; }
+						}
+						return { ...item, from, to };
+					});
+			} else {
+				const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
+				this.feedbackItems = raw.map((item, i) => {
+					const id = `f${i}`;
+					let from = 0, to = 0;
+					if (item.studentText) {
+						const idx = studentNotes.indexOf(item.studentText);
+						if (idx !== -1) { from = idx; to = idx + item.studentText.length; }
+					}
+					return { ...item, id, from, to };
+				});
+				this.initialFeedbackItems = [...this.feedbackItems];
+			}
 			this.prevStudentNotes = studentNotes;
 		} catch (e) {
 			this.sidebarBodyEl.createEl("p", { text: `Recheck failed: ${(e as Error).message}`, cls: "nr-sidebar-error" });
@@ -922,7 +968,9 @@ export class RecorderView extends ItemView {
 			this.metacogBtn.disabled  = true;
 			this.clearHighlights();
 			this.closeSidebar();
-			this.feedbackItems   = [];
+			this.feedbackItems        = [];
+			this.initialFeedbackItems = [];
+			this.prevStudentNotes     = "";
 			this.metacogSections = [];
 			this.metacogGivenUpSections = new Set();
 			this.quizQuestions = [];

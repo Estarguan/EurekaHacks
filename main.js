@@ -5198,71 +5198,39 @@ async function generateFeedback(studentNotes, aiNotes, apiKey) {
   ]);
   return [...confusionItems, ...knowledgeItems];
 }
-async function recheckFeedback(prevNotes, currNotes, aiNotes, apiKey) {
-  const prevSet = new Set(prevNotes.split("\n").map((l) => l.trim()).filter(Boolean));
-  const changed = currNotes.split("\n").map((l) => l.trim()).filter((l) => l && !prevSet.has(l)).join("\n");
-  if (!changed) return generateFeedback(currNotes, aiNotes, apiKey);
-  const [confusionItems, knowledgeItems] = await Promise.all([
-    recheckConfusion(changed, currNotes, apiKey),
-    recheckKnowledge(changed, currNotes, aiNotes, apiKey)
-  ]);
-  return [...confusionItems, ...knowledgeItems];
-}
-async function recheckConfusion(changedText, fullNotes, apiKey) {
-  const text = await groqChat(apiKey, `The student revised their notes. Check ONLY the revised text for confusion, uncertainty, sloppiness, or unclear writing. Ignore unchanged content.
+async function filterResolvedFeedback(originalItems, updatedNotes, apiKey) {
+  if (originalItems.length === 0) return [];
+  const itemSummary = originalItems.map((f) => ({
+    id: f.id,
+    type: f.type,
+    studentText: f.studentText || "",
+    question: f.question,
+    answer: f.answer
+  }));
+  const text = await groqChat(apiKey, `Review these feedback issues against updated student notes. Determine which are STILL present and unresolved.
 
-Revised text:
-${changedText}
+Original issues:
+${JSON.stringify(itemSummary, null, 2)}
 
-Full notes (context only \u2014 do not flag things outside the revised text):
-${fullNotes}
+Updated student notes:
+${updatedNotes}
 
-Return ONLY a raw JSON array \u2014 no markdown, no explanation:
-[
-  {
-    "studentText": "exact phrase from the revised text that has the problem",
-    "question": "Socratic question making the student realise the problem",
-    "hints": ["gentle nudge", "more direct", "almost gives it away"],
-    "answer": "what is wrong and what to write instead",
-    "type": "unclear"
-  }
-]
-If nothing in the revised text is problematic, return [].`);
+For each issue decide:
+- "missing": has the student now added this concept? If yes \u2192 resolved.
+- "incorrect": is the incorrect statement gone or corrected? If yes \u2192 resolved.
+- "incomplete": is it now explained sufficiently? If yes \u2192 resolved.
+- "verbose": has the verbose passage been meaningfully shortened? If yes \u2192 resolved.
+- "unclear": has the unclear passage been rewritten clearly? If yes \u2192 resolved.
+
+Return ONLY a raw JSON array of IDs that are STILL UNRESOLVED. Do not include IDs that have been fixed.
+["f0", "f2", ...]
+
+If all issues are resolved, return [].`);
   const clean = text.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
   try {
     return JSON.parse(clean);
   } catch (e) {
-    return [];
-  }
-}
-async function recheckKnowledge(changedText, fullNotes, aiNotes, apiKey) {
-  const text = await groqChat(apiKey, `The student revised their notes. Evaluate ONLY the revised text against the reference \u2014 is it accurate, complete, and appropriately detailed?
-
-Revised text to evaluate:
-${changedText}
-
-Full notes (context only \u2014 do not flag things outside the revised text):
-${fullNotes}
-
-Reference notes:
-${aiNotes}
-
-Return ONLY a raw JSON array \u2014 no markdown fences, no explanation:
-[
-  {
-    "studentText": "exact phrase from the revised text, or empty string if something is still missing",
-    "question": "Socratic question nudging them toward the issue",
-    "hints": ["subtle nudge", "more direct", "almost gives it away"],
-    "answer": "what is wrong and why it matters",
-    "type": "missing|incorrect|incomplete|verbose"
-  }
-]
-If the revised text is accurate and complete, return [].`);
-  const clean = text.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
-  try {
-    return JSON.parse(clean);
-  } catch (e) {
-    return [];
+    return originalItems.map((f) => f.id);
   }
 }
 async function detectConfusion(studentNotes, apiKey) {
@@ -5690,8 +5658,10 @@ var RecorderView = class extends import_obsidian.ItemView {
     this.metacogGivenUpSections = /* @__PURE__ */ new Set();
     // Brain state
     this.brainScore = 0;
-    // Snapshot of notes at last feedback run — used for recheck diffing
+    // Snapshot of notes at last feedback run — used to gate the Re-check button
     this.prevStudentNotes = "";
+    // Canonical issue set from the first feedback run; rechecks can only shrink it
+    this.initialFeedbackItems = [];
     this.plugin = plugin;
   }
   getViewType() {
@@ -5767,7 +5737,10 @@ var RecorderView = class extends import_obsidian.ItemView {
           obsidianEditorTheme,
           highlightField,
           import_view4.EditorView.updateListener.of((update) => {
-            if (update.docChanged) this.updateWordCount();
+            if (update.docChanged) {
+              this.updateWordCount();
+              this.updateRecheckButtonState();
+            }
           })
         ]
       }),
@@ -5911,30 +5884,48 @@ var RecorderView = class extends import_obsidian.ItemView {
       return;
     }
     const prevCount = this.feedbackItems.length;
-    const isRecheck = this.prevStudentNotes !== "";
+    const isRecheck = this.initialFeedbackItems.length > 0;
     this.feedbackBtn.disabled = true;
     this.feedbackBtn.setText("Analyzing\u2026");
     this.clearHighlights();
     this.metacogSections = [];
     this.metacogGivenUpSections = /* @__PURE__ */ new Set();
+    let succeeded = false;
     try {
-      const raw = isRecheck ? await recheckFeedback(this.prevStudentNotes, studentNotes, this.generatedMarkdown, apiKey) : await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
-      this.feedbackItems = raw.map((item, i) => {
-        const id = `f${i}`;
-        let from = 0, to = 0;
-        if (item.studentText) {
-          const idx = studentNotes.indexOf(item.studentText);
-          if (idx !== -1) {
-            from = idx;
-            to = idx + item.studentText.length;
+      if (isRecheck) {
+        const unresolvedIds = await filterResolvedFeedback(this.initialFeedbackItems, studentNotes, apiKey);
+        const unresolvedSet = new Set(unresolvedIds);
+        this.feedbackItems = this.initialFeedbackItems.filter((item) => unresolvedSet.has(item.id)).map((item) => {
+          let from = 0, to = 0;
+          if (item.studentText) {
+            const idx = studentNotes.indexOf(item.studentText);
+            if (idx !== -1) {
+              from = idx;
+              to = idx + item.studentText.length;
+            }
           }
-        }
-        return { ...item, id, from, to };
-      });
+          return { ...item, from, to };
+        });
+      } else {
+        const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
+        this.feedbackItems = raw.map((item, i) => {
+          const id = `f${i}`;
+          let from = 0, to = 0;
+          if (item.studentText) {
+            const idx = studentNotes.indexOf(item.studentText);
+            if (idx !== -1) {
+              from = idx;
+              to = idx + item.studentText.length;
+            }
+          }
+          return { ...item, id, from, to };
+        });
+        this.initialFeedbackItems = [...this.feedbackItems];
+      }
       this.prevStudentNotes = studentNotes;
+      succeeded = true;
       this.applyHighlights();
       const count2 = this.feedbackItems.filter((f) => f.from < f.to).length;
-      new import_obsidian.Notice(`${count2} issue${count2 !== 1 ? "s" : ""} highlighted \u2014 click any underlined text to see feedback.`);
       if (isRecheck) {
         if (this.feedbackItems.length < prevCount) {
           this.triggerBrainEvent("success", "Nice Change!");
@@ -5960,9 +5951,19 @@ var RecorderView = class extends import_obsidian.ItemView {
     } catch (e) {
       this.showError(`Feedback failed: ${e.message}`);
     } finally {
-      this.feedbackBtn.disabled = false;
-      this.feedbackBtn.setText("Re-check");
+      if (succeeded) {
+        this.feedbackBtn.disabled = true;
+        this.feedbackBtn.setText("Re-check");
+      } else {
+        this.feedbackBtn.disabled = false;
+        this.feedbackBtn.setText(isRecheck ? "Re-check" : "Get Feedback");
+      }
     }
+  }
+  updateRecheckButtonState() {
+    if (this.prevStudentNotes === "") return;
+    const current = this.cmEditor.state.doc.toString().trim();
+    this.feedbackBtn.disabled = !current || current === this.prevStudentNotes;
   }
   openFeedbackPopup(id) {
     const item = this.feedbackItems.find((f) => f.id === id);
@@ -6020,6 +6021,8 @@ var RecorderView = class extends import_obsidian.ItemView {
           }
           return { ...item, id, from, to };
         });
+        this.initialFeedbackItems = [...this.feedbackItems];
+        this.prevStudentNotes = studentNotes;
       } catch (e) {
         this.sidebarBodyEl.empty();
         this.sidebarBodyEl.createEl("p", { text: `Analysis failed: ${e.message}`, cls: "nr-sidebar-error" });
@@ -6205,7 +6208,6 @@ var RecorderView = class extends import_obsidian.ItemView {
     const apiKey = this.plugin.settings.groqApiKey;
     if (!studentNotes || !apiKey) return;
     const prevCount = this.feedbackItems.length;
-    this.feedbackItems = [];
     this.metacogSections = [];
     this.metacogGivenUpSections = /* @__PURE__ */ new Set();
     this.brainScore = 0;
@@ -6214,19 +6216,36 @@ var RecorderView = class extends import_obsidian.ItemView {
     this.sidebarBodyEl.empty();
     this.sidebarBodyEl.innerHTML = '<div class="nr-sidebar-loading"><span class="nr-spinner"></span><p>Running feedback analysis\u2026</p></div>';
     try {
-      const raw = this.prevStudentNotes ? await recheckFeedback(this.prevStudentNotes, studentNotes, this.generatedMarkdown, apiKey) : await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
-      this.feedbackItems = raw.map((item, i) => {
-        const id = `f${i}`;
-        let from = 0, to = 0;
-        if (item.studentText) {
-          const idx = studentNotes.indexOf(item.studentText);
-          if (idx !== -1) {
-            from = idx;
-            to = idx + item.studentText.length;
+      if (this.initialFeedbackItems.length > 0) {
+        const unresolvedIds = await filterResolvedFeedback(this.initialFeedbackItems, studentNotes, apiKey);
+        const unresolvedSet = new Set(unresolvedIds);
+        this.feedbackItems = this.initialFeedbackItems.filter((item) => unresolvedSet.has(item.id)).map((item) => {
+          let from = 0, to = 0;
+          if (item.studentText) {
+            const idx = studentNotes.indexOf(item.studentText);
+            if (idx !== -1) {
+              from = idx;
+              to = idx + item.studentText.length;
+            }
           }
-        }
-        return { ...item, id, from, to };
-      });
+          return { ...item, from, to };
+        });
+      } else {
+        const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
+        this.feedbackItems = raw.map((item, i) => {
+          const id = `f${i}`;
+          let from = 0, to = 0;
+          if (item.studentText) {
+            const idx = studentNotes.indexOf(item.studentText);
+            if (idx !== -1) {
+              from = idx;
+              to = idx + item.studentText.length;
+            }
+          }
+          return { ...item, id, from, to };
+        });
+        this.initialFeedbackItems = [...this.feedbackItems];
+      }
       this.prevStudentNotes = studentNotes;
     } catch (e) {
       this.sidebarBodyEl.createEl("p", { text: `Recheck failed: ${e.message}`, cls: "nr-sidebar-error" });
@@ -6294,6 +6313,8 @@ var RecorderView = class extends import_obsidian.ItemView {
       this.clearHighlights();
       this.closeSidebar();
       this.feedbackItems = [];
+      this.initialFeedbackItems = [];
+      this.prevStudentNotes = "";
       this.metacogSections = [];
       this.metacogGivenUpSections = /* @__PURE__ */ new Set();
       this.quizQuestions = [];
