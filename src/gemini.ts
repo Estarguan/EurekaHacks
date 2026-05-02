@@ -4,7 +4,7 @@ export interface FeedbackItem {
 	question: string;
 	hints: string[];   // progressive hints, subtle → direct
 	answer: string;    // full explanation revealed on give up
-	type: "missing" | "incorrect" | "incomplete" | "verbose";
+	type: "missing" | "incorrect" | "incomplete" | "verbose" | "unclear";
 	from: number;
 	to: number;
 }
@@ -36,37 +36,70 @@ export async function generateFeedback(
 	aiNotes: string,
 	apiKey: string
 ): Promise<Omit<FeedbackItem, "id" | "from" | "to">[]> {
-	const text = await groqChat(apiKey, `You are an educational feedback assistant. Compare the student's notes against the AI reference notes and identify 3-6 specific issues.
+	// Two focused calls in parallel — one per concern
+	const [confusionItems, knowledgeItems] = await Promise.all([
+		detectConfusion(studentNotes, apiKey),
+		checkKnowledge(studentNotes, aiNotes, apiKey),
+	]);
+	return [...confusionItems, ...knowledgeItems];
+}
 
-Return ONLY a raw JSON array — no markdown fences, no explanation, just the array:
+async function detectConfusion(
+	studentNotes: string,
+	apiKey: string
+): Promise<Omit<FeedbackItem, "id" | "from" | "to">[]> {
+	const text = await groqChat(apiKey, `Read these student notes and flag every moment that strikes you as confused, uncertain, sloppy, or unprofessional. Use your own judgement — don't hold back. If something feels off, flag it.
+
+Return ONLY a raw JSON array — no markdown, no explanation:
 [
   {
-    "studentText": "exact phrase from student notes to highlight, or empty string if content is completely missing",
-    "question": "Socratic question that nudges the student toward the issue without giving the answer",
-    "hints": [
-      "subtle nudge — barely a hint, makes them think",
-      "more direct — points at what to look for",
-      "very specific — nearly gives it away but still makes them connect the dots"
-    ],
-    "answer": "full clear explanation of what was wrong or missing and why it matters",
+    "studentText": "the exact phrase from the notes that has the problem (as short as possible)",
+    "question": "a Socratic question that makes the student realize why this is a problem",
+    "hints": ["gentle nudge", "more direct", "almost gives it away"],
+    "answer": "what is wrong and what to write instead",
+    "type": "unclear"
+  }
+]
+
+Student Notes:
+${studentNotes}`);
+
+	const clean = text.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
+	try { return JSON.parse(clean); } catch { return []; }
+}
+
+async function checkKnowledge(
+	studentNotes: string,
+	aiNotes: string,
+	apiKey: string
+): Promise<Omit<FeedbackItem, "id" | "from" | "to">[]> {
+	const text = await groqChat(apiKey, `Compare these student notes against the reference notes. Flag whatever you think is wrong — missing ideas, incorrect facts, things not explained well enough, anything over-explained. Use your judgement on what matters.
+
+Return ONLY a raw JSON array — no markdown fences, no explanation:
+[
+  {
+    "studentText": "exact phrase from student notes, or empty string if something is completely missing",
+    "question": "Socratic question nudging them toward the issue",
+    "hints": ["subtle nudge", "more direct", "almost gives it away"],
+    "answer": "what is wrong and why it matters",
     "type": "missing|incorrect|incomplete|verbose"
   }
 ]
 
 Type meanings:
-- "missing": important concept absent from student notes — set studentText to empty string
-- "incorrect": student wrote something factually wrong — copy EXACT text from student notes
-- "incomplete": student touched on it but did not fully explain — copy EXACT text
-- "verbose": could be more concise — copy EXACT text
+- "incomplete": mentioned but not explained enough
+- "missing": important idea completely absent — use empty studentText
+- "incorrect": factually wrong
+- "verbose": over-explained, should be shorter
 
-AI Reference Notes:
+Reference Notes:
 ${aiNotes}
 
 Student Notes:
 ${studentNotes}`);
 
 	const clean = text.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
-	return JSON.parse(clean);
+	try { return JSON.parse(clean); } catch { return []; }
 }
 
 async function groqChat(apiKey: string, prompt: string): Promise<string> {
@@ -99,6 +132,148 @@ Question asked: ${item.question}
 ${previousHints.length > 0 ? `Previous hints already given:\n${previousHints.map((h, i) => `${i + 1}. ${h}`).join("\n")}` : ""}
 
 Write only the next hint — more direct than the previous ones but still don't give away the full answer. Return only the hint text, nothing else.`);
+}
+
+// ── Metacognition ─────────────────────────────────────────────────────────────
+
+export interface MetacognitionSection {
+	title: string;
+	studentExcerpt: string; // brief quote from student notes for this topic, or ""
+	aiScore: number;        // 1–10
+	feedbackIds: string[];  // IDs of feedback items that belong to this section
+}
+
+export async function groupFeedbackIntoSections(
+	feedbackItems: FeedbackItem[],
+	studentNotes: string,
+	aiNotes: string,
+	apiKey: string
+): Promise<MetacognitionSection[]> {
+	const itemSummary = feedbackItems.map(f => ({
+		id: f.id,
+		type: f.type,
+		studentText: f.studentText || "",
+	}));
+
+	const raw = await groqChat(apiKey, `Assign these feedback items to topic sections from the lecture.
+
+Feedback items:
+${JSON.stringify(itemSummary, null, 2)}
+
+AI Reference Notes:
+${aiNotes}
+
+Student Notes:
+${studentNotes}
+
+Create 4–6 sections based strictly on LECTURE TOPICS (e.g. "Cell Membrane Structure", "DNA Replication"). Never create sections named "Common Issues", "Miscellaneous", "General Notes", "Other Issues", or any issue-type category.
+
+Assign every feedback item to exactly one section. Sections with no issues are allowed (good coverage).
+
+aiScore: how well the student covered this topic (9–10 = no issues; 7–8 = minor; 5–6 = moderate; 3–4 = serious gaps; 1–2 = mostly wrong/missing).
+
+Return ONLY a raw JSON array, no markdown:
+[{
+  "title": "lecture topic name",
+  "studentExcerpt": "exact quote ≤15 words from student notes for this topic, or empty string",
+  "aiScore": <1–10 integer>,
+  "feedbackIds": ["f0", "f3", ...]
+}]`);
+
+	const cleaned = raw.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
+	const sections: MetacognitionSection[] = JSON.parse(cleaned);
+	// Strip any meta-sections the model may sneak in
+	const meta = /common\s*issue|miscellaneous|general\s*note|^other$|^summary$/i;
+	return sections.filter(s => !meta.test(s.title.trim()));
+}
+
+export async function generateComparisonFeedback(
+	sections: MetacognitionSection[],
+	feedbackItems: FeedbackItem[],
+	userScores: number[],
+	apiKey: string
+): Promise<string[]> {
+	const byId = new Map(feedbackItems.map(f => [f.id, f]));
+	const payload = sections.map((s, i) => ({
+		title: s.title,
+		userScore: userScores[i],
+		aiScore: s.aiScore,
+		issueCount: s.feedbackIds.length,
+		issues: s.feedbackIds.map(id => byId.get(id)?.type).filter(Boolean),
+	}));
+
+	const raw = await groqChat(apiKey, `A student rated their own notes section-by-section. Compare each self-rating to the AI's assessment and write one short Socratic response per section.
+
+Rules:
+- If user overrated (user > AI by 2+): point out the gap directly. Name the specific issues. Ask what they think they missed.
+- If user underrated (AI > user by 2+): acknowledge their self-doubt but show the notes are stronger than they think.
+- If accurate (within 1–2): validate their self-awareness briefly.
+
+Keep each response to 1–2 sentences. Be direct and specific.
+
+Sections:
+${JSON.stringify(payload, null, 2)}
+
+Return ONLY a raw JSON array of strings, one per section, no markdown:
+["feedback for section 0", "feedback for section 1", ...]`);
+
+	return JSON.parse(raw.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim());
+}
+
+// ── Quiz ─────────────────────────────────────────────────────────────────────
+
+export interface QuizQuestion {
+	type: "explain" | "whatif" | "quiz";
+	question: string;
+	sampleAnswer: string;
+}
+
+export async function generateQuizQuestions(
+	transcript: string,
+	aiNotes: string,
+	apiKey: string
+): Promise<QuizQuestion[]> {
+	return JSON.parse(
+		(await groqChat(apiKey, `Generate 6 study questions for a student. Base everything ONLY on the lecture below — do not use outside knowledge. Every question and answer must come directly from this lecture's content.
+
+Generate exactly:
+- 2 of type "explain": Ask the student to explain a core concept simply, as if to someone with no background (Feynman technique). Start with "Explain..." or "In your own words, what is..."
+- 2 of type "whatif": Hypothetical application questions that extend a concept from the lecture. Start with "What if..."
+- 2 of type "quiz": Direct factual questions that could appear on a real exam about this specific lecture.
+
+Return ONLY a raw JSON array, no markdown:
+[{ "type": "explain|whatif|quiz", "question": "...", "sampleAnswer": "concise model answer from lecture content only" }]
+
+Lecture Transcript:
+${transcript}
+
+Lecture Notes:
+${aiNotes}`))
+		.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim()
+	);
+}
+
+export async function evaluateAnswer(
+	question: QuizQuestion,
+	studentAnswer: string,
+	transcript: string,
+	apiKey: string
+): Promise<{ score: "good" | "partial" | "needs-work"; feedback: string }> {
+	const raw = await groqChat(apiKey, `Evaluate a student's answer based ONLY on the lecture transcript below. Do not use outside knowledge.
+
+Question: ${question.question}
+Expected answer (reference): ${question.sampleAnswer}
+Student's answer: ${studentAnswer}
+
+Lecture:
+${transcript}
+
+Return ONLY a raw JSON object, no markdown:
+{ "score": "good|partial|needs-work", "feedback": "1-2 sentences of specific feedback grounded in the lecture" }
+
+Scoring: "good" = correct and reasonably complete; "partial" = right idea but missing key detail; "needs-work" = incorrect or too vague`);
+
+	return JSON.parse(raw.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim());
 }
 
 export async function generateNotes(transcript: string, apiKey: string): Promise<string> {

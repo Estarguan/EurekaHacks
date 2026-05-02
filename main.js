@@ -5192,36 +5192,66 @@ async function transcribeAudio(blob, apiKey) {
   return data2.text;
 }
 async function generateFeedback(studentNotes, aiNotes, apiKey) {
-  const text = await groqChat(apiKey, `You are an educational feedback assistant. Compare the student's notes against the AI reference notes and identify 3-6 specific issues.
+  const [confusionItems, knowledgeItems] = await Promise.all([
+    detectConfusion(studentNotes, apiKey),
+    checkKnowledge(studentNotes, aiNotes, apiKey)
+  ]);
+  return [...confusionItems, ...knowledgeItems];
+}
+async function detectConfusion(studentNotes, apiKey) {
+  const text = await groqChat(apiKey, `Read these student notes and flag every moment that strikes you as confused, uncertain, sloppy, or unprofessional. Use your own judgement \u2014 don't hold back. If something feels off, flag it.
 
-Return ONLY a raw JSON array \u2014 no markdown fences, no explanation, just the array:
+Return ONLY a raw JSON array \u2014 no markdown, no explanation:
 [
   {
-    "studentText": "exact phrase from student notes to highlight, or empty string if content is completely missing",
-    "question": "Socratic question that nudges the student toward the issue without giving the answer",
-    "hints": [
-      "subtle nudge \u2014 barely a hint, makes them think",
-      "more direct \u2014 points at what to look for",
-      "very specific \u2014 nearly gives it away but still makes them connect the dots"
-    ],
-    "answer": "full clear explanation of what was wrong or missing and why it matters",
+    "studentText": "the exact phrase from the notes that has the problem (as short as possible)",
+    "question": "a Socratic question that makes the student realize why this is a problem",
+    "hints": ["gentle nudge", "more direct", "almost gives it away"],
+    "answer": "what is wrong and what to write instead",
+    "type": "unclear"
+  }
+]
+
+Student Notes:
+${studentNotes}`);
+  const clean = text.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
+  try {
+    return JSON.parse(clean);
+  } catch (e) {
+    return [];
+  }
+}
+async function checkKnowledge(studentNotes, aiNotes, apiKey) {
+  const text = await groqChat(apiKey, `Compare these student notes against the reference notes. Flag whatever you think is wrong \u2014 missing ideas, incorrect facts, things not explained well enough, anything over-explained. Use your judgement on what matters.
+
+Return ONLY a raw JSON array \u2014 no markdown fences, no explanation:
+[
+  {
+    "studentText": "exact phrase from student notes, or empty string if something is completely missing",
+    "question": "Socratic question nudging them toward the issue",
+    "hints": ["subtle nudge", "more direct", "almost gives it away"],
+    "answer": "what is wrong and why it matters",
     "type": "missing|incorrect|incomplete|verbose"
   }
 ]
 
 Type meanings:
-- "missing": important concept absent from student notes \u2014 set studentText to empty string
-- "incorrect": student wrote something factually wrong \u2014 copy EXACT text from student notes
-- "incomplete": student touched on it but did not fully explain \u2014 copy EXACT text
-- "verbose": could be more concise \u2014 copy EXACT text
+- "incomplete": mentioned but not explained enough
+- "missing": important idea completely absent \u2014 use empty studentText
+- "incorrect": factually wrong
+- "verbose": over-explained, should be shorter
 
-AI Reference Notes:
+Reference Notes:
 ${aiNotes}
 
 Student Notes:
 ${studentNotes}`);
   const clean = text.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
-  return JSON.parse(clean);
+  try {
+    return JSON.parse(clean);
+  } catch (e) {
+    return [];
+  }
 }
 async function groqChat(apiKey, prompt) {
   const res = await fetch(`${GROQ_BASE}/chat/completions`, {
@@ -5249,6 +5279,104 @@ ${previousHints.length > 0 ? `Previous hints already given:
 ${previousHints.map((h, i) => `${i + 1}. ${h}`).join("\n")}` : ""}
 
 Write only the next hint \u2014 more direct than the previous ones but still don't give away the full answer. Return only the hint text, nothing else.`);
+}
+async function groupFeedbackIntoSections(feedbackItems, studentNotes, aiNotes, apiKey) {
+  const itemSummary = feedbackItems.map((f) => ({
+    id: f.id,
+    type: f.type,
+    studentText: f.studentText || ""
+  }));
+  const raw = await groqChat(apiKey, `Assign these feedback items to topic sections from the lecture.
+
+Feedback items:
+${JSON.stringify(itemSummary, null, 2)}
+
+AI Reference Notes:
+${aiNotes}
+
+Student Notes:
+${studentNotes}
+
+Create 4\u20136 sections based strictly on LECTURE TOPICS (e.g. "Cell Membrane Structure", "DNA Replication"). Never create sections named "Common Issues", "Miscellaneous", "General Notes", "Other Issues", or any issue-type category.
+
+Assign every feedback item to exactly one section. Sections with no issues are allowed (good coverage).
+
+aiScore: how well the student covered this topic (9\u201310 = no issues; 7\u20138 = minor; 5\u20136 = moderate; 3\u20134 = serious gaps; 1\u20132 = mostly wrong/missing).
+
+Return ONLY a raw JSON array, no markdown:
+[{
+  "title": "lecture topic name",
+  "studentExcerpt": "exact quote \u226415 words from student notes for this topic, or empty string",
+  "aiScore": <1\u201310 integer>,
+  "feedbackIds": ["f0", "f3", ...]
+}]`);
+  const cleaned = raw.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
+  const sections = JSON.parse(cleaned);
+  const meta = /common\s*issue|miscellaneous|general\s*note|^other$|^summary$/i;
+  return sections.filter((s) => !meta.test(s.title.trim()));
+}
+async function generateComparisonFeedback(sections, feedbackItems, userScores, apiKey) {
+  const byId = new Map(feedbackItems.map((f) => [f.id, f]));
+  const payload = sections.map((s, i) => ({
+    title: s.title,
+    userScore: userScores[i],
+    aiScore: s.aiScore,
+    issueCount: s.feedbackIds.length,
+    issues: s.feedbackIds.map((id) => {
+      var _a;
+      return (_a = byId.get(id)) == null ? void 0 : _a.type;
+    }).filter(Boolean)
+  }));
+  const raw = await groqChat(apiKey, `A student rated their own notes section-by-section. Compare each self-rating to the AI's assessment and write one short Socratic response per section.
+
+Rules:
+- If user overrated (user > AI by 2+): point out the gap directly. Name the specific issues. Ask what they think they missed.
+- If user underrated (AI > user by 2+): acknowledge their self-doubt but show the notes are stronger than they think.
+- If accurate (within 1\u20132): validate their self-awareness briefly.
+
+Keep each response to 1\u20132 sentences. Be direct and specific.
+
+Sections:
+${JSON.stringify(payload, null, 2)}
+
+Return ONLY a raw JSON array of strings, one per section, no markdown:
+["feedback for section 0", "feedback for section 1", ...]`);
+  return JSON.parse(raw.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim());
+}
+async function generateQuizQuestions(transcript, aiNotes, apiKey) {
+  return JSON.parse(
+    (await groqChat(apiKey, `Generate 6 study questions for a student. Base everything ONLY on the lecture below \u2014 do not use outside knowledge. Every question and answer must come directly from this lecture's content.
+
+Generate exactly:
+- 2 of type "explain": Ask the student to explain a core concept simply, as if to someone with no background (Feynman technique). Start with "Explain..." or "In your own words, what is..."
+- 2 of type "whatif": Hypothetical application questions that extend a concept from the lecture. Start with "What if..."
+- 2 of type "quiz": Direct factual questions that could appear on a real exam about this specific lecture.
+
+Return ONLY a raw JSON array, no markdown:
+[{ "type": "explain|whatif|quiz", "question": "...", "sampleAnswer": "concise model answer from lecture content only" }]
+
+Lecture Transcript:
+${transcript}
+
+Lecture Notes:
+${aiNotes}`)).replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim()
+  );
+}
+async function evaluateAnswer(question3, studentAnswer, transcript, apiKey) {
+  const raw = await groqChat(apiKey, `Evaluate a student's answer based ONLY on the lecture transcript below. Do not use outside knowledge.
+
+Question: ${question3.question}
+Expected answer (reference): ${question3.sampleAnswer}
+Student's answer: ${studentAnswer}
+
+Lecture:
+${transcript}
+
+Return ONLY a raw JSON object, no markdown:
+{ "score": "good|partial|needs-work", "feedback": "1-2 sentences of specific feedback grounded in the lecture" }
+
+Scoring: "good" = correct and reasonably complete; "partial" = right idea but missing key detail; "needs-work" = incorrect or too vague`);
+  return JSON.parse(raw.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim());
 }
 async function generateNotes(transcript, apiKey) {
   return groqChat(apiKey, `You are a note-taking assistant. Convert this lecture transcript into clear, structured notes. Use markdown with headings (##), bullet points, and **bold** for key terms. Be concise \u2014 capture the key ideas, not every word.
@@ -5369,7 +5497,8 @@ var FeedbackModal = class extends import_obsidian.Modal {
       incomplete: "Expand this",
       missing: "Add this concept",
       incorrect: "Incorrect",
-      verbose: "Too verbose \u2014 shorten"
+      verbose: "Too verbose \u2014 shorten",
+      unclear: "Rewrite more clearly"
     };
     contentEl.createEl("span", {
       text: (_a = typeLabel[this.item.type]) != null ? _a : this.item.type,
@@ -5477,10 +5606,16 @@ var RecorderView = class extends import_obsidian.ItemView {
     this.transcript = "";
     this.generatedMarkdown = "";
     this.feedbackItems = [];
+    this.quizQuestions = [];
     this.timerInterval = null;
     this.seconds = 0;
     this.isRecording = false;
     this.savedVaultPath = null;
+    // Metacognition state
+    this.mode = "normal";
+    this.metacogSections = [];
+    this.metacogUserScores = [];
+    this.metacogGivenUpSections = /* @__PURE__ */ new Set();
     this.plugin = plugin;
   }
   getViewType() {
@@ -5515,9 +5650,12 @@ var RecorderView = class extends import_obsidian.ItemView {
     const tabBar = container.createDiv("nr-tab-bar");
     const recordTab = tabBar.createEl("button", { text: "Record", cls: "nr-tab nr-tab-active" });
     const reviewTab = tabBar.createEl("button", { text: "Review", cls: "nr-tab" });
+    const quizTab = tabBar.createEl("button", { text: "Quiz", cls: "nr-tab" });
     const recordPane = container.createDiv("nr-pane nr-pane-active");
-    recordPane.createEl("h3", { text: "Your Notes", cls: "nr-panel-title nr-pane-title" });
-    const editorEl = recordPane.createDiv("nr-cm-editor");
+    const recordMain = recordPane.createDiv("nr-record-main");
+    const editorArea = recordMain.createDiv("nr-editor-area");
+    editorArea.createEl("h3", { text: "Your Notes", cls: "nr-panel-title" });
+    const editorEl = editorArea.createDiv("nr-cm-editor");
     this.cmEditor = new import_view4.EditorView({
       state: import_state4.EditorState.create({
         doc: "",
@@ -5547,22 +5685,31 @@ var RecorderView = class extends import_obsidian.ItemView {
       const cls = [...hl.classList].find((c) => c.startsWith("nr-hl-f"));
       if (cls) this.openFeedbackPopup(cls.replace("nr-hl-", ""));
     });
-    this.wordCountEl = recordPane.createDiv("nr-wordcount");
+    this.wordCountEl = editorArea.createDiv("nr-wordcount");
     this.wordCountEl.setText("0 words");
-    const legend = recordPane.createDiv("nr-legend");
+    const legend = editorArea.createDiv("nr-legend");
     legend.style.display = "none";
     legend.id = "nr-legend";
     const legendItems = [
       ["expand", "Expand"],
       ["missing", "Add concept"],
       ["incorrect", "Incorrect"],
-      ["shorten", "Too verbose"]
+      ["shorten", "Too verbose"],
+      ["unclear", "Rewrite clearly"]
     ];
     for (const [cls, label] of legendItems) {
       const item = legend.createDiv("nr-legend-item");
       item.createEl("span", { cls: `nr-legend-dot nr-legend-${cls}` });
       item.createEl("span", { text: label, cls: "nr-legend-label" });
     }
+    this.sidebarEl = recordMain.createDiv("nr-sidebar");
+    this.sidebarEl.style.display = "none";
+    const sidebarHeader = this.sidebarEl.createDiv("nr-sidebar-header");
+    this.sidebarTitleEl = sidebarHeader.createEl("span", { cls: "nr-sidebar-title" });
+    const closeBtn = sidebarHeader.createEl("button", { cls: "nr-sidebar-close", attr: { "aria-label": "Close" } });
+    closeBtn.setText("\u2715");
+    closeBtn.addEventListener("click", () => this.closeSidebar());
+    this.sidebarBodyEl = this.sidebarEl.createDiv("nr-sidebar-body");
     const reviewPane = container.createDiv("nr-pane");
     const reviewPanels = reviewPane.createDiv("nr-panels");
     const transcriptPanel = reviewPanels.createDiv("nr-panel");
@@ -5576,13 +5723,22 @@ var RecorderView = class extends import_obsidian.ItemView {
     this.aiNotesStatusEl = aiPanel.createDiv("nr-ai-status");
     this.aiNotesEl = aiPanel.createDiv("nr-ai-notes");
     this.aiNotesEl.createEl("p", { text: "AI-generated notes will appear here after recording stops.", cls: "nr-placeholder" });
-    const panes = [recordPane, reviewPane];
-    const tabs = [recordTab, reviewTab];
-    const switchTab = (idx) => {
-      tabs.forEach((t, i) => t.toggleClass("nr-tab-active", i === idx));
-      panes.forEach((p, i) => p.toggleClass("nr-pane-active", i === idx));
-    };
-    tabs.forEach((tab, i) => tab.addEventListener("click", () => switchTab(i)));
+    const quizPane = container.createDiv("nr-pane");
+    const quizHeader = quizPane.createDiv("nr-quiz-header");
+    quizHeader.createEl("h3", { text: "Quiz Yourself", cls: "nr-panel-title" });
+    this.newQuestionsBtn = quizHeader.createEl("button", { text: "\u21BB New Questions", cls: "nr-new-questions-btn" });
+    this.newQuestionsBtn.style.display = "none";
+    this.newQuestionsBtn.addEventListener("click", () => this.generateQuestions());
+    this.quizStatusEl = quizPane.createDiv("nr-quiz-status");
+    this.quizStatusEl.createEl("p", { text: "Record a lecture first, then come back here to quiz yourself.", cls: "nr-placeholder" });
+    this.quizQuestionsEl = quizPane.createDiv("nr-quiz-questions");
+    const panes = [recordPane, reviewPane, quizPane];
+    const tabs = [recordTab, reviewTab, quizTab];
+    tabs.forEach((tab, i) => tab.addEventListener("click", () => {
+      tabs.forEach((t, j) => t.toggleClass("nr-tab-active", j === i));
+      panes.forEach((p, j) => p.toggleClass("nr-pane-active", j === i));
+      if (i === 2 && this.transcript && this.quizQuestions.length === 0) this.generateQuestions();
+    }));
     const footer = container.createDiv("nr-footer");
     this.saveBtn = footer.createEl("button", { text: "Save to Vault", cls: "nr-save-btn" });
     this.saveBtn.disabled = true;
@@ -5590,12 +5746,294 @@ var RecorderView = class extends import_obsidian.ItemView {
     this.feedbackBtn = footer.createEl("button", { text: "Get Feedback", cls: "nr-feedback-btn" });
     this.feedbackBtn.disabled = true;
     this.feedbackBtn.addEventListener("click", () => this.runFeedback());
+    this.metacogBtn = footer.createEl("button", { text: "\u{1F9E0} Metacognition", cls: "nr-metacog-btn" });
+    this.metacogBtn.disabled = true;
+    this.metacogBtn.addEventListener("click", () => {
+      if (this.mode === "metacognition") this.closeSidebar();
+      else this.openMetacognitionMode();
+    });
   }
   async onClose() {
     var _a;
     if (this.isRecording) await this.stopRecording();
     (_a = this.cmEditor) == null ? void 0 : _a.destroy();
   }
+  // ── Feedback (popup) ──────────────────────────────────────────────────────
+  async runFeedback() {
+    const studentNotes = this.cmEditor.state.doc.toString().trim();
+    if (!studentNotes) {
+      this.showError("Write some notes first before getting feedback.");
+      return;
+    }
+    if (!this.generatedMarkdown) {
+      this.showError("No AI notes yet \u2014 record a lecture first.");
+      return;
+    }
+    const apiKey = this.plugin.settings.groqApiKey;
+    if (!apiKey) {
+      this.showError("No Groq API key. Add it in Settings \u2192 NoteReal.");
+      return;
+    }
+    this.feedbackBtn.disabled = true;
+    this.feedbackBtn.setText("Analyzing\u2026");
+    this.clearHighlights();
+    this.metacogSections = [];
+    this.metacogGivenUpSections = /* @__PURE__ */ new Set();
+    try {
+      const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
+      this.feedbackItems = raw.map((item, i) => {
+        const id = `f${i}`;
+        let from = 0, to = 0;
+        if (item.studentText) {
+          const idx = studentNotes.indexOf(item.studentText);
+          if (idx !== -1) {
+            from = idx;
+            to = idx + item.studentText.length;
+          }
+        }
+        return { ...item, id, from, to };
+      });
+      this.applyHighlights();
+      const count2 = this.feedbackItems.filter((f) => f.from < f.to).length;
+      new import_obsidian.Notice(`${count2} issue${count2 !== 1 ? "s" : ""} highlighted \u2014 click any underlined text to see feedback.`);
+      const legend = this.containerEl.querySelector("#nr-legend");
+      if (legend) legend.style.display = "flex";
+      if (this.mode === "metacognition") {
+        this.sidebarBodyEl.empty();
+        this.sidebarBodyEl.innerHTML = '<div class="nr-sidebar-loading"><span class="nr-spinner"></span><p>Regrouping sections\u2026</p></div>';
+        await this.loadMetacognitionSections(studentNotes, apiKey);
+      }
+    } catch (e) {
+      this.showError(`Feedback failed: ${e.message}`);
+    } finally {
+      this.feedbackBtn.disabled = false;
+      this.feedbackBtn.setText("Re-check");
+    }
+  }
+  openFeedbackPopup(id) {
+    const item = this.feedbackItems.find((f) => f.id === id);
+    if (!item) return;
+    new FeedbackModal(this.app, item, this.plugin.settings.groqApiKey).open();
+  }
+  applyHighlights() {
+    const highlights = this.feedbackItems.filter((item) => item.from < item.to).map(({ from, to, id, type }) => ({ from, to, id, type }));
+    this.cmEditor.dispatch({ effects: setHighlights.of(highlights) });
+  }
+  applyMetacogRevealedHighlights() {
+    const revealedIds = /* @__PURE__ */ new Set();
+    this.metacogSections.forEach((s, i) => {
+      if (this.metacogGivenUpSections.has(i)) s.feedbackIds.forEach((id) => revealedIds.add(id));
+    });
+    const highlights = this.feedbackItems.filter((item) => revealedIds.has(item.id) && item.from < item.to).map(({ from, to, id, type }) => ({ from, to, id, type }));
+    this.cmEditor.dispatch({ effects: setHighlights.of(highlights) });
+  }
+  clearHighlights() {
+    this.cmEditor.dispatch({ effects: setHighlights.of([]) });
+  }
+  // ── Metacognition mode (sidebar) ──────────────────────────────────────────
+  async openMetacognitionMode() {
+    const studentNotes = this.cmEditor.state.doc.toString().trim();
+    if (!studentNotes) {
+      this.showError("Write some notes first before doing a metacognition check.");
+      return;
+    }
+    const apiKey = this.plugin.settings.groqApiKey;
+    if (!apiKey) {
+      this.showError("No Groq API key. Add it in Settings \u2192 NoteReal.");
+      return;
+    }
+    this.mode = "metacognition";
+    this.metacogUserScores = [];
+    this.metacogGivenUpSections = /* @__PURE__ */ new Set();
+    this.metacogBtn.addClass("nr-mode-active");
+    this.sidebarTitleEl.setText("\u{1F9E0} Metacognition");
+    this.sidebarEl.style.display = "flex";
+    this.sidebarBodyEl.empty();
+    this.clearHighlights();
+    if (this.feedbackItems.length === 0) {
+      this.sidebarBodyEl.innerHTML = '<div class="nr-sidebar-loading"><span class="nr-spinner"></span><p>Running feedback analysis\u2026</p></div>';
+      try {
+        const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
+        this.feedbackItems = raw.map((item, i) => {
+          const id = `f${i}`;
+          let from = 0, to = 0;
+          if (item.studentText) {
+            const idx = studentNotes.indexOf(item.studentText);
+            if (idx !== -1) {
+              from = idx;
+              to = idx + item.studentText.length;
+            }
+          }
+          return { ...item, id, from, to };
+        });
+      } catch (e) {
+        this.sidebarBodyEl.empty();
+        this.sidebarBodyEl.createEl("p", { text: `Analysis failed: ${e.message}`, cls: "nr-sidebar-error" });
+        return;
+      }
+    }
+    await this.loadMetacognitionSections(studentNotes, apiKey);
+  }
+  async loadMetacognitionSections(studentNotes, apiKey) {
+    if (this.metacogSections.length === 0) {
+      this.sidebarBodyEl.empty();
+      this.sidebarBodyEl.innerHTML = '<div class="nr-sidebar-loading"><span class="nr-spinner"></span><p>Identifying knowledge sections\u2026</p></div>';
+      try {
+        this.metacogSections = await groupFeedbackIntoSections(
+          this.feedbackItems,
+          studentNotes,
+          this.generatedMarkdown,
+          apiKey
+        );
+      } catch (e) {
+        this.sidebarBodyEl.empty();
+        this.sidebarBodyEl.createEl("p", { text: `Section analysis failed: ${e.message}`, cls: "nr-sidebar-error" });
+        return;
+      }
+    }
+    this.metacogUserScores = new Array(this.metacogSections.length).fill(0);
+    this.renderMetacognitionRating();
+  }
+  renderMetacognitionRating() {
+    this.sidebarBodyEl.empty();
+    this.sidebarBodyEl.createEl("p", {
+      text: "Rate how well YOU covered each topic, then compare with the AI.",
+      cls: "nr-sidebar-intro"
+    });
+    this.metacogSections.forEach((section, i) => {
+      const card = this.sidebarBodyEl.createDiv("nr-metacog-card");
+      card.createEl("h4", { text: section.title, cls: "nr-metacog-section-title" });
+      if (section.studentExcerpt) {
+        card.createEl("p", { text: `"${section.studentExcerpt}"`, cls: "nr-metacog-excerpt" });
+      } else {
+        card.createEl("p", { text: "Nothing written about this topic.", cls: "nr-placeholder" });
+      }
+      card.createEl("p", { text: "Your rating:", cls: "nr-metacog-rating-label" });
+      const row = card.createDiv("nr-metacog-rating-row");
+      for (let n = 1; n <= 10; n++) {
+        const btn = row.createEl("button", { text: String(n), cls: "nr-rating-btn" });
+        btn.addEventListener("click", () => {
+          this.metacogUserScores[i] = n;
+          row.querySelectorAll(".nr-rating-btn").forEach((b, bi) => b.toggleClass("nr-rating-selected", bi < n));
+          compareBtn.disabled = this.metacogUserScores.some((s) => s === 0);
+        });
+      }
+    });
+    const compareBtn = this.sidebarBodyEl.createEl("button", {
+      text: "Compare with AI \u2192",
+      cls: "nr-metacog-compare-btn"
+    });
+    compareBtn.disabled = true;
+    compareBtn.addEventListener("click", () => this.runMetacognitionComparison(compareBtn));
+  }
+  async runMetacognitionComparison(compareBtn) {
+    compareBtn.disabled = true;
+    compareBtn.setText("Analyzing\u2026");
+    const apiKey = this.plugin.settings.groqApiKey;
+    let feedback;
+    try {
+      feedback = await generateComparisonFeedback(this.metacogSections, this.feedbackItems, this.metacogUserScores, apiKey);
+    } catch (e) {
+      feedback = this.metacogSections.map(() => "Could not generate feedback.");
+    }
+    this.renderMetacognitionResults(feedback);
+  }
+  renderMetacognitionResults(feedback) {
+    this.sidebarBodyEl.empty();
+    const topRow = this.sidebarBodyEl.createDiv("nr-sidebar-summary");
+    topRow.createEl("span", { text: "Self-assessment vs AI", cls: "nr-sidebar-count" });
+    const recheckBtn = topRow.createEl("button", { text: "\u21BB Recheck", cls: "nr-sidebar-recheck-btn" });
+    recheckBtn.addEventListener("click", () => this.recheckAll());
+    const byId = new Map(this.feedbackItems.map((f) => [f.id, f]));
+    this.metacogSections.forEach((section, i) => {
+      var _a;
+      const userScore = this.metacogUserScores[i];
+      const aiScore = section.aiScore;
+      const gap = userScore - aiScore;
+      const gapClass = gap > 2 ? "nr-gap-over" : gap < -2 ? "nr-gap-under" : "nr-gap-ok";
+      const card = this.sidebarBodyEl.createDiv("nr-metacog-card nr-metacog-result");
+      card.createEl("h4", { text: section.title, cls: "nr-metacog-section-title" });
+      const scores = card.createDiv("nr-metacog-scores");
+      scores.createEl("span", { text: `You: ${userScore}/10`, cls: "nr-score-user" });
+      scores.createEl("span", { text: "\xB7", cls: "nr-score-sep" });
+      scores.createEl("span", { text: `AI: ${aiScore}/10`, cls: `nr-score-ai ${gapClass}` });
+      card.createEl("p", { text: (_a = feedback[i]) != null ? _a : "", cls: "nr-metacog-feedback" });
+      if (section.feedbackIds.length > 0) {
+        const issuesWrap = card.createDiv("nr-metacog-issues-wrap");
+        issuesWrap.style.display = "none";
+        const giveUpBtn = card.createEl("button", {
+          text: "Give up \u2014 show issues",
+          cls: "nr-giveup-btn"
+        });
+        giveUpBtn.addEventListener("click", () => {
+          this.metacogGivenUpSections.add(i);
+          giveUpBtn.style.display = "none";
+          issuesWrap.style.display = "block";
+          this.applyMetacogRevealedHighlights();
+          const typeLabel = {
+            incomplete: "Expand this",
+            missing: "Add this concept",
+            incorrect: "Incorrect",
+            verbose: "Too verbose",
+            unclear: "Rewrite clearly"
+          };
+          section.feedbackIds.forEach((id) => {
+            var _a2;
+            const item = byId.get(id);
+            if (!item) return;
+            const row = issuesWrap.createDiv("nr-metacog-issue-row");
+            row.createEl("span", {
+              text: (_a2 = typeLabel[item.type]) != null ? _a2 : item.type,
+              cls: `nr-type-badge nr-type-${item.type}`
+            });
+            if (item.studentText) {
+              row.createEl("span", {
+                text: ` "${item.studentText.slice(0, 60)}${item.studentText.length > 60 ? "\u2026" : ""}"`,
+                cls: "nr-metacog-issue-quote"
+              });
+            }
+          });
+        });
+      }
+    });
+  }
+  async recheckAll() {
+    const studentNotes = this.cmEditor.state.doc.toString().trim();
+    const apiKey = this.plugin.settings.groqApiKey;
+    if (!studentNotes || !apiKey) return;
+    this.feedbackItems = [];
+    this.metacogSections = [];
+    this.metacogGivenUpSections = /* @__PURE__ */ new Set();
+    this.clearHighlights();
+    this.sidebarBodyEl.empty();
+    this.sidebarBodyEl.innerHTML = '<div class="nr-sidebar-loading"><span class="nr-spinner"></span><p>Running feedback analysis\u2026</p></div>';
+    try {
+      const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
+      this.feedbackItems = raw.map((item, i) => {
+        const id = `f${i}`;
+        let from = 0, to = 0;
+        if (item.studentText) {
+          const idx = studentNotes.indexOf(item.studentText);
+          if (idx !== -1) {
+            from = idx;
+            to = idx + item.studentText.length;
+          }
+        }
+        return { ...item, id, from, to };
+      });
+    } catch (e) {
+      this.sidebarBodyEl.createEl("p", { text: `Recheck failed: ${e.message}`, cls: "nr-sidebar-error" });
+      return;
+    }
+    await this.loadMetacognitionSections(studentNotes, apiKey);
+  }
+  closeSidebar() {
+    this.mode = "normal";
+    this.sidebarEl.style.display = "none";
+    this.metacogBtn.removeClass("nr-mode-active");
+    if (this.feedbackItems.length > 0) this.applyHighlights();
+  }
+  // ── Recording ─────────────────────────────────────────────────────────────
   async toggleRecording() {
     this.isRecording ? await this.stopRecording() : await this.startRecording();
   }
@@ -5613,9 +6051,7 @@ var RecorderView = class extends import_obsidian.ItemView {
         const label = mic.label || `Microphone ${this.micSelect.options.length + 1}`;
         this.micSelect.createEl("option", { text: label, value: mic.deviceId });
       }
-      if (prev && [...this.micSelect.options].some((o) => o.value === prev)) {
-        this.micSelect.value = prev;
-      }
+      if (prev && [...this.micSelect.options].some((o) => o.value === prev)) this.micSelect.value = prev;
     } catch (e) {
     }
   }
@@ -5641,8 +6077,17 @@ var RecorderView = class extends import_obsidian.ItemView {
       this.saveBtn.disabled = true;
       this.feedbackBtn.disabled = true;
       this.feedbackBtn.setText("Get Feedback");
-      this.feedbackBtn.onclick = () => this.runFeedback();
+      this.metacogBtn.disabled = true;
       this.clearHighlights();
+      this.closeSidebar();
+      this.feedbackItems = [];
+      this.metacogSections = [];
+      this.metacogGivenUpSections = /* @__PURE__ */ new Set();
+      this.quizQuestions = [];
+      this.quizQuestionsEl.empty();
+      this.newQuestionsBtn.style.display = "none";
+      this.quizStatusEl.empty();
+      this.quizStatusEl.createEl("p", { text: "Record a lecture first, then come back here to quiz yourself.", cls: "nr-placeholder" });
       this.mediaRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) this.audioChunks.push(e.data);
       };
@@ -5690,6 +6135,7 @@ var RecorderView = class extends import_obsidian.ItemView {
       await import_obsidian.MarkdownRenderer.render(this.app, this.generatedMarkdown, this.aiNotesEl, "", this);
       this.saveBtn.disabled = false;
       this.feedbackBtn.disabled = false;
+      this.metacogBtn.disabled = false;
       return;
     }
     const apiKey = this.plugin.settings.groqApiKey;
@@ -5715,72 +6161,91 @@ var RecorderView = class extends import_obsidian.ItemView {
       await import_obsidian.MarkdownRenderer.render(this.app, this.generatedMarkdown, this.aiNotesEl, "", this);
       this.saveBtn.disabled = false;
       this.feedbackBtn.disabled = false;
+      this.metacogBtn.disabled = false;
     } catch (e) {
       this.showError(`Note generation failed: ${e.message}`);
       this.aiNotesStatusEl.empty();
     }
   }
-  // ── Feedback ──────────────────────────────────────────────────────────────
-  async runFeedback() {
-    const studentNotes = this.cmEditor.state.doc.toString().trim();
-    if (!studentNotes) {
-      this.showError("Write some notes first before getting feedback.");
-      return;
-    }
-    if (!this.generatedMarkdown) {
-      this.showError("No AI notes yet \u2014 record a lecture first.");
-      return;
-    }
+  // ── Quiz ──────────────────────────────────────────────────────────────────
+  async generateQuestions() {
     const apiKey = this.plugin.settings.groqApiKey;
     if (!apiKey) {
-      this.showError("No Groq API key. Add it in Settings \u2192 NoteReal.");
+      this.showError("No Groq API key.");
       return;
     }
-    this.feedbackBtn.disabled = true;
-    this.feedbackBtn.setText("Analyzing\u2026");
-    this.clearHighlights();
+    this.quizQuestionsEl.empty();
+    this.quizStatusEl.empty();
+    this.quizStatusEl.innerHTML = '<span class="nr-spinner"></span> Generating questions\u2026';
+    this.newQuestionsBtn.disabled = true;
+    this.newQuestionsBtn.style.display = "";
     try {
-      const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
-      this.feedbackItems = raw.map((item, i) => {
-        const id = `f${i}`;
-        let from = 0, to = 0;
-        if (item.studentText) {
-          const idx = studentNotes.indexOf(item.studentText);
-          if (idx !== -1) {
-            from = idx;
-            to = idx + item.studentText.length;
-          }
-        }
-        return { ...item, id, from, to };
-      });
-      this.applyHighlights();
-      const count2 = this.feedbackItems.filter((f) => f.from < f.to).length;
-      new import_obsidian.Notice(`${count2} issue${count2 !== 1 ? "s" : ""} highlighted \u2014 click any underlined text to see feedback.`);
-      const legend = this.containerEl.querySelector("#nr-legend");
-      if (legend) legend.style.display = "flex";
+      this.quizQuestions = await generateQuizQuestions(this.transcript, this.generatedMarkdown, apiKey);
+      this.quizStatusEl.empty();
+      this.renderQuizQuestions();
     } catch (e) {
-      this.showError(`Feedback failed: ${e.message}`);
+      this.quizStatusEl.empty();
+      this.showError(`Quiz generation failed: ${e.message}`);
     } finally {
-      this.feedbackBtn.disabled = false;
-      this.feedbackBtn.setText("Save & Re-check");
-      this.feedbackBtn.onclick = async () => {
-        await this.saveToVault();
-        this.feedbackBtn.onclick = () => this.runFeedback();
-        await this.runFeedback();
-      };
+      this.newQuestionsBtn.disabled = false;
     }
   }
-  openFeedbackPopup(id) {
-    const item = this.feedbackItems.find((f) => f.id === id);
-    if (!item) return;
-    new FeedbackModal(this.app, item, this.plugin.settings.groqApiKey).open();
+  renderQuizQuestions() {
+    this.quizQuestionsEl.empty();
+    const sections = [
+      { type: "explain", icon: "\u{1F9D2}", label: "Explain Simply" },
+      { type: "whatif", icon: "\u{1F914}", label: "What If?" },
+      { type: "quiz", icon: "\u270F\uFE0F", label: "Quiz" }
+    ];
+    for (const { type, icon, label } of sections) {
+      const qs = this.quizQuestions.filter((q) => q.type === type);
+      if (!qs.length) continue;
+      const section = this.quizQuestionsEl.createDiv("nr-quiz-section");
+      section.createEl("h4", { text: `${icon}  ${label}`, cls: "nr-quiz-section-title" });
+      for (const q of qs) this.renderQuestionCard(section, q);
+    }
   }
-  applyHighlights() {
-    const highlights = this.feedbackItems.filter((item) => item.from < item.to).map(({ from, to, id, type }) => ({ from, to, id, type }));
-    this.cmEditor.dispatch({ effects: setHighlights.of(highlights) });
-  }
-  clearHighlights() {
-    this.cmEditor.dispatch({ effects: setHighlights.of([]) });
+  renderQuestionCard(parent, q) {
+    const card = parent.createDiv("nr-quiz-card");
+    card.createEl("p", { text: q.question, cls: "nr-quiz-question" });
+    const textarea = card.createEl("textarea", {
+      cls: "nr-quiz-answer",
+      attr: { placeholder: "Write your answer here\u2026" }
+    });
+    const actions = card.createDiv("nr-quiz-actions");
+    const checkBtn = actions.createEl("button", { text: "Check Answer", cls: "nr-quiz-check-btn" });
+    const revealBtn = actions.createEl("button", { text: "Show Sample Answer", cls: "nr-quiz-reveal-btn" });
+    const sampleEl = card.createDiv("nr-quiz-sample");
+    sampleEl.createEl("p", { text: "Sample Answer", cls: "nr-quiz-sample-label" });
+    sampleEl.createEl("p", { text: q.sampleAnswer, cls: "nr-quiz-sample-text" });
+    sampleEl.style.display = "none";
+    const feedbackEl = card.createDiv("nr-quiz-feedback");
+    feedbackEl.style.display = "none";
+    checkBtn.addEventListener("click", async () => {
+      if (!textarea.value.trim()) return;
+      checkBtn.disabled = true;
+      checkBtn.setText("Checking\u2026");
+      feedbackEl.style.display = "none";
+      try {
+        const result = await evaluateAnswer(q, textarea.value.trim(), this.transcript, this.plugin.settings.groqApiKey);
+        const labels = { good: "\u2713  Good", partial: "\u25D0  Partial", "needs-work": "\u2717  Needs work" };
+        feedbackEl.empty();
+        feedbackEl.setAttribute("class", `nr-quiz-feedback nr-quiz-fb-${result.score}`);
+        feedbackEl.createEl("strong", { text: labels[result.score] + "  " });
+        feedbackEl.createEl("span", { text: result.feedback });
+        feedbackEl.style.display = "block";
+      } catch (e) {
+        this.showError(`Evaluation failed: ${e.message}`);
+      } finally {
+        checkBtn.disabled = false;
+        checkBtn.setText("Check Answer");
+      }
+    });
+    revealBtn.addEventListener("click", () => {
+      const shown = sampleEl.style.display !== "none";
+      sampleEl.style.display = shown ? "none" : "block";
+      revealBtn.setText(shown ? "Show Sample Answer" : "Hide Sample Answer");
+    });
   }
   // ── Save ──────────────────────────────────────────────────────────────────
   async saveToVault() {
@@ -5814,9 +6279,7 @@ var RecorderView = class extends import_obsidian.ItemView {
       this.cmEditor.state.doc.toString()
     ].join("\n");
     try {
-      if (folder && !await this.app.vault.adapter.exists(folder)) {
-        await this.app.vault.createFolder(folder);
-      }
+      if (folder && !await this.app.vault.adapter.exists(folder)) await this.app.vault.createFolder(folder);
       const exists = await this.app.vault.adapter.exists(this.savedVaultPath);
       if (exists) {
         const file = this.app.vault.getAbstractFileByPath(this.savedVaultPath);

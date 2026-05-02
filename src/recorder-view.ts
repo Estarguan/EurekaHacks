@@ -6,7 +6,7 @@ import { bracketMatching, indentOnInput, syntaxHighlighting, HighlightStyle } fr
 import { markdown } from "@codemirror/lang-markdown";
 import { tags } from "@lezer/highlight";
 import type NoteRealPlugin from "./main";
-import { transcribeAudio, generateNotes, generateFeedback, generateNextHint, FeedbackItem } from "./gemini";
+import { transcribeAudio, generateNotes, generateFeedback, generateNextHint, generateQuizQuestions, evaluateAnswer, groupFeedbackIntoSections, generateComparisonFeedback, FeedbackItem, QuizQuestion, MetacognitionSection } from "./gemini";
 import { TEST_MODE, SAMPLE_TRANSCRIPT, SAMPLE_AI_NOTES } from "./sample-data";
 
 export const RECORDER_VIEW_TYPE = "notereal-recorder";
@@ -56,6 +56,7 @@ class FeedbackModal extends Modal {
 			missing:    "Add this concept",
 			incorrect:  "Incorrect",
 			verbose:    "Too verbose — shorten",
+			unclear:    "Rewrite more clearly",
 		};
 
 		contentEl.createEl("span", {
@@ -113,8 +114,6 @@ class FeedbackModal extends Modal {
 		hintBtn.addEventListener("click", async () => {
 			hintBtn.disabled = true;
 			hintBtn.setText("Thinking…");
-
-			// Use pre-generated hints first, then fetch more on demand
 			const pregenerated = this.item.hints ?? [];
 			if (shownHints.length < pregenerated.length) {
 				addHint(pregenerated[shownHints.length]);
@@ -138,29 +137,27 @@ class FeedbackModal extends Modal {
 		});
 	}
 
-	onClose() {
-		this.contentEl.empty();
-	}
+	onClose() { this.contentEl.empty(); }
 }
 
-// ── Markdown highlight style (Obsidian-like) ─────────────────────────────────
+// ── Markdown highlight style ──────────────────────────────────────────────────
 
 const markdownHighlight = HighlightStyle.define([
-	{ tag: tags.heading1,         class: "cm-md-h1" },
-	{ tag: tags.heading2,         class: "cm-md-h2" },
-	{ tag: tags.heading3,         class: "cm-md-h3" },
-	{ tag: tags.heading4,         class: "cm-md-h4" },
-	{ tag: tags.strong,           class: "cm-md-strong" },
-	{ tag: tags.emphasis,         class: "cm-md-em" },
-	{ tag: tags.strikethrough,    class: "cm-md-strike" },
-	{ tag: tags.monospace,        class: "cm-md-code" },
-	{ tag: tags.link,             class: "cm-md-link" },
-	{ tag: tags.url,              class: "cm-md-url" },
-	{ tag: tags.quote,            class: "cm-md-quote" },
-	{ tag: tags.list,             class: "cm-md-list" },
-	{ tag: tags.meta,             class: "cm-md-meta" },
+	{ tag: tags.heading1,              class: "cm-md-h1"     },
+	{ tag: tags.heading2,              class: "cm-md-h2"     },
+	{ tag: tags.heading3,              class: "cm-md-h3"     },
+	{ tag: tags.heading4,              class: "cm-md-h4"     },
+	{ tag: tags.strong,                class: "cm-md-strong" },
+	{ tag: tags.emphasis,              class: "cm-md-em"     },
+	{ tag: tags.strikethrough,         class: "cm-md-strike" },
+	{ tag: tags.monospace,             class: "cm-md-code"   },
+	{ tag: tags.link,                  class: "cm-md-link"   },
+	{ tag: tags.url,                   class: "cm-md-url"    },
+	{ tag: tags.quote,                 class: "cm-md-quote"  },
+	{ tag: tags.list,                  class: "cm-md-list"   },
+	{ tag: tags.meta,                  class: "cm-md-meta"   },
 	{ tag: tags.processingInstruction, class: "cm-md-marker" },
-	{ tag: tags.contentSeparator, class: "cm-md-hr" },
+	{ tag: tags.contentSeparator,      class: "cm-md-hr"     },
 ]);
 
 // ── Editor theme ──────────────────────────────────────────────────────────────
@@ -187,10 +184,17 @@ export class RecorderView extends ItemView {
 	private transcript = "";
 	private generatedMarkdown = "";
 	private feedbackItems: FeedbackItem[] = [];
+	private quizQuestions: QuizQuestion[] = [];
 	private timerInterval: number | null = null;
 	private seconds = 0;
 	private isRecording = false;
 	private savedVaultPath: string | null = null;
+
+	// Metacognition state
+	private mode: "normal" | "metacognition" = "normal";
+	private metacogSections: MetacognitionSection[] = [];
+	private metacogUserScores: number[] = [];
+	private metacogGivenUpSections: Set<number> = new Set();
 
 	private recordBtn!: HTMLButtonElement;
 	private micSelect!: HTMLSelectElement;
@@ -204,6 +208,15 @@ export class RecorderView extends ItemView {
 	private wordCountEl!: HTMLElement;
 	private saveBtn!: HTMLButtonElement;
 	private feedbackBtn!: HTMLButtonElement;
+	private metacogBtn!: HTMLButtonElement;
+	private quizQuestionsEl!: HTMLElement;
+	private quizStatusEl!: HTMLElement;
+	private newQuestionsBtn!: HTMLButtonElement;
+
+	// Metacognition sidebar
+	private sidebarEl!: HTMLElement;
+	private sidebarBodyEl!: HTMLElement;
+	private sidebarTitleEl!: HTMLElement;
 
 	constructor(leaf: WorkspaceLeaf, plugin: NoteRealPlugin) {
 		super(leaf);
@@ -225,7 +238,7 @@ export class RecorderView extends ItemView {
 		titleRow.createEl("span", { text: "NoteReal", cls: "nr-title" });
 		titleRow.createEl("span", { text: "Anti-AI", cls: "nr-badge" });
 
-		// Record bar (always visible)
+		// Record bar
 		const recBar = container.createDiv("nr-rec-bar");
 		this.recordBtn = recBar.createEl("button", { cls: "nr-record-btn" });
 		this.recordBtn.innerHTML = '<span class="nr-dot"></span> Start Recording';
@@ -243,16 +256,20 @@ export class RecorderView extends ItemView {
 		this.errorEl = container.createDiv("nr-error");
 		this.errorEl.style.display = "none";
 
-		// Tab bar (Record + Review only)
+		// Tab bar
 		const tabBar = container.createDiv("nr-tab-bar");
 		const recordTab = tabBar.createEl("button", { text: "Record", cls: "nr-tab nr-tab-active" });
 		const reviewTab = tabBar.createEl("button", { text: "Review", cls: "nr-tab" });
+		const quizTab   = tabBar.createEl("button", { text: "Quiz",   cls: "nr-tab" });
 
 		// ── Record pane ───────────────────────────────────────────────
 		const recordPane = container.createDiv("nr-pane nr-pane-active");
-		recordPane.createEl("h3", { text: "Your Notes", cls: "nr-panel-title nr-pane-title" });
+		const recordMain = recordPane.createDiv("nr-record-main");
 
-		const editorEl = recordPane.createDiv("nr-cm-editor");
+		const editorArea = recordMain.createDiv("nr-editor-area");
+		editorArea.createEl("h3", { text: "Your Notes", cls: "nr-panel-title" });
+
+		const editorEl = editorArea.createDiv("nr-cm-editor");
 		this.cmEditor = new EditorView({
 			state: EditorState.create({
 				doc: "",
@@ -276,7 +293,7 @@ export class RecorderView extends ItemView {
 			parent: editorEl,
 		});
 
-		// Click highlighted text → open feedback popup for that item
+		// Click highlighted text → open feedback popup
 		this.cmEditor.dom.addEventListener("mousedown", (e) => {
 			const target = e.target as HTMLElement;
 			const hl = target.closest('[class*="nr-hl-f"]') as HTMLElement | null;
@@ -285,11 +302,10 @@ export class RecorderView extends ItemView {
 			if (cls) this.openFeedbackPopup(cls.replace("nr-hl-", ""));
 		});
 
-		this.wordCountEl = recordPane.createDiv("nr-wordcount");
+		this.wordCountEl = editorArea.createDiv("nr-wordcount");
 		this.wordCountEl.setText("0 words");
 
-		// Highlight legend — hidden until first feedback run
-		const legend = recordPane.createDiv("nr-legend");
+		const legend = editorArea.createDiv("nr-legend");
 		legend.style.display = "none";
 		legend.id = "nr-legend";
 		const legendItems: [string, string][] = [
@@ -297,12 +313,25 @@ export class RecorderView extends ItemView {
 			["missing",   "Add concept"],
 			["incorrect", "Incorrect"],
 			["shorten",   "Too verbose"],
+			["unclear",   "Rewrite clearly"],
 		];
 		for (const [cls, label] of legendItems) {
 			const item = legend.createDiv("nr-legend-item");
 			item.createEl("span", { cls: `nr-legend-dot nr-legend-${cls}` });
 			item.createEl("span", { text: label, cls: "nr-legend-label" });
 		}
+
+		// Metacognition sidebar (hidden until mode is active)
+		this.sidebarEl = recordMain.createDiv("nr-sidebar");
+		this.sidebarEl.style.display = "none";
+
+		const sidebarHeader = this.sidebarEl.createDiv("nr-sidebar-header");
+		this.sidebarTitleEl = sidebarHeader.createEl("span", { cls: "nr-sidebar-title" });
+		const closeBtn = sidebarHeader.createEl("button", { cls: "nr-sidebar-close", attr: { "aria-label": "Close" } });
+		closeBtn.setText("✕");
+		closeBtn.addEventListener("click", () => this.closeSidebar());
+
+		this.sidebarBodyEl = this.sidebarEl.createDiv("nr-sidebar-body");
 
 		// ── Review pane ───────────────────────────────────────────────
 		const reviewPane = container.createDiv("nr-pane");
@@ -321,14 +350,27 @@ export class RecorderView extends ItemView {
 		this.aiNotesEl = aiPanel.createDiv("nr-ai-notes");
 		this.aiNotesEl.createEl("p", { text: "AI-generated notes will appear here after recording stops.", cls: "nr-placeholder" });
 
+		// ── Quiz pane ─────────────────────────────────────────────────
+		const quizPane = container.createDiv("nr-pane");
+		const quizHeader = quizPane.createDiv("nr-quiz-header");
+		quizHeader.createEl("h3", { text: "Quiz Yourself", cls: "nr-panel-title" });
+		this.newQuestionsBtn = quizHeader.createEl("button", { text: "↻ New Questions", cls: "nr-new-questions-btn" });
+		this.newQuestionsBtn.style.display = "none";
+		this.newQuestionsBtn.addEventListener("click", () => this.generateQuestions());
+
+		this.quizStatusEl = quizPane.createDiv("nr-quiz-status");
+		this.quizStatusEl.createEl("p", { text: "Record a lecture first, then come back here to quiz yourself.", cls: "nr-placeholder" });
+
+		this.quizQuestionsEl = quizPane.createDiv("nr-quiz-questions");
+
 		// Tab switching
-		const panes = [recordPane, reviewPane];
-		const tabs = [recordTab, reviewTab];
-		const switchTab = (idx: number) => {
-			tabs.forEach((t, i) => t.toggleClass("nr-tab-active", i === idx));
-			panes.forEach((p, i) => p.toggleClass("nr-pane-active", i === idx));
-		};
-		tabs.forEach((tab, i) => tab.addEventListener("click", () => switchTab(i)));
+		const panes = [recordPane, reviewPane, quizPane];
+		const tabs  = [recordTab,  reviewTab,  quizTab];
+		tabs.forEach((tab, i) => tab.addEventListener("click", () => {
+			tabs.forEach((t, j) => t.toggleClass("nr-tab-active", j === i));
+			panes.forEach((p, j) => p.toggleClass("nr-pane-active", j === i));
+			if (i === 2 && this.transcript && this.quizQuestions.length === 0) this.generateQuestions();
+		}));
 
 		// Footer
 		const footer = container.createDiv("nr-footer");
@@ -339,12 +381,321 @@ export class RecorderView extends ItemView {
 		this.feedbackBtn = footer.createEl("button", { text: "Get Feedback", cls: "nr-feedback-btn" });
 		this.feedbackBtn.disabled = true;
 		this.feedbackBtn.addEventListener("click", () => this.runFeedback());
+
+		this.metacogBtn = footer.createEl("button", { text: "🧠 Metacognition", cls: "nr-metacog-btn" });
+		this.metacogBtn.disabled = true;
+		this.metacogBtn.addEventListener("click", () => {
+			if (this.mode === "metacognition") this.closeSidebar();
+			else this.openMetacognitionMode();
+		});
 	}
 
 	async onClose() {
 		if (this.isRecording) await this.stopRecording();
 		this.cmEditor?.destroy();
 	}
+
+	// ── Feedback (popup) ──────────────────────────────────────────────────────
+
+	private async runFeedback() {
+		const studentNotes = this.cmEditor.state.doc.toString().trim();
+		if (!studentNotes) { this.showError("Write some notes first before getting feedback."); return; }
+		if (!this.generatedMarkdown) { this.showError("No AI notes yet — record a lecture first."); return; }
+		const apiKey = this.plugin.settings.groqApiKey;
+		if (!apiKey) { this.showError("No Groq API key. Add it in Settings → NoteReal."); return; }
+
+		this.feedbackBtn.disabled = true;
+		this.feedbackBtn.setText("Analyzing…");
+		this.clearHighlights();
+		// Invalidate cached sections since feedback items are changing
+		this.metacogSections = [];
+		this.metacogGivenUpSections = new Set();
+
+		try {
+			const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
+
+			this.feedbackItems = raw.map((item, i) => {
+				const id = `f${i}`;
+				let from = 0, to = 0;
+				if (item.studentText) {
+					const idx = studentNotes.indexOf(item.studentText);
+					if (idx !== -1) { from = idx; to = idx + item.studentText.length; }
+				}
+				return { ...item, id, from, to };
+			});
+
+			this.applyHighlights();
+			const count = this.feedbackItems.filter(f => f.from < f.to).length;
+			new Notice(`${count} issue${count !== 1 ? "s" : ""} highlighted — click any underlined text to see feedback.`);
+
+			const legend = this.containerEl.querySelector("#nr-legend") as HTMLElement | null;
+			if (legend) legend.style.display = "flex";
+
+			// If metacognition sidebar is open, refresh it with new data
+			if (this.mode === "metacognition") {
+				this.sidebarBodyEl.empty();
+				this.sidebarBodyEl.innerHTML = '<div class="nr-sidebar-loading"><span class="nr-spinner"></span><p>Regrouping sections…</p></div>';
+				await this.loadMetacognitionSections(studentNotes, apiKey);
+			}
+		} catch (e) {
+			this.showError(`Feedback failed: ${(e as Error).message}`);
+		} finally {
+			this.feedbackBtn.disabled = false;
+			this.feedbackBtn.setText("Re-check");
+		}
+	}
+
+	private openFeedbackPopup(id: string) {
+		const item = this.feedbackItems.find((f) => f.id === id);
+		if (!item) return;
+		new FeedbackModal(this.app, item, this.plugin.settings.groqApiKey).open();
+	}
+
+	private applyHighlights() {
+		const highlights = this.feedbackItems
+			.filter((item) => item.from < item.to)
+			.map(({ from, to, id, type }) => ({ from, to, id, type }));
+		this.cmEditor.dispatch({ effects: setHighlights.of(highlights) });
+	}
+
+	private applyMetacogRevealedHighlights() {
+		const revealedIds = new Set<string>();
+		this.metacogSections.forEach((s, i) => {
+			if (this.metacogGivenUpSections.has(i)) s.feedbackIds.forEach(id => revealedIds.add(id));
+		});
+		const highlights = this.feedbackItems
+			.filter(item => revealedIds.has(item.id) && item.from < item.to)
+			.map(({ from, to, id, type }) => ({ from, to, id, type }));
+		this.cmEditor.dispatch({ effects: setHighlights.of(highlights) });
+	}
+
+	private clearHighlights() {
+		this.cmEditor.dispatch({ effects: setHighlights.of([]) });
+	}
+
+	// ── Metacognition mode (sidebar) ──────────────────────────────────────────
+
+	private async openMetacognitionMode() {
+		const studentNotes = this.cmEditor.state.doc.toString().trim();
+		if (!studentNotes) { this.showError("Write some notes first before doing a metacognition check."); return; }
+		const apiKey = this.plugin.settings.groqApiKey;
+		if (!apiKey) { this.showError("No Groq API key. Add it in Settings → NoteReal."); return; }
+
+		this.mode = "metacognition";
+		this.metacogUserScores = [];
+		this.metacogGivenUpSections = new Set();
+		this.metacogBtn.addClass("nr-mode-active");
+		this.sidebarTitleEl.setText("🧠 Metacognition");
+		this.sidebarEl.style.display = "flex";
+		this.sidebarBodyEl.empty();
+
+		// Clear highlights for the self-assessment experience
+		this.clearHighlights();
+
+		// Need feedback items before we can group sections
+		if (this.feedbackItems.length === 0) {
+			this.sidebarBodyEl.innerHTML = '<div class="nr-sidebar-loading"><span class="nr-spinner"></span><p>Running feedback analysis…</p></div>';
+			try {
+				const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
+				this.feedbackItems = raw.map((item, i) => {
+					const id = `f${i}`;
+					let from = 0, to = 0;
+					if (item.studentText) {
+						const idx = studentNotes.indexOf(item.studentText);
+						if (idx !== -1) { from = idx; to = idx + item.studentText.length; }
+					}
+					return { ...item, id, from, to };
+				});
+			} catch (e) {
+				this.sidebarBodyEl.empty();
+				this.sidebarBodyEl.createEl("p", { text: `Analysis failed: ${(e as Error).message}`, cls: "nr-sidebar-error" });
+				return;
+			}
+		}
+
+		await this.loadMetacognitionSections(studentNotes, apiKey);
+	}
+
+	private async loadMetacognitionSections(studentNotes: string, apiKey: string) {
+		if (this.metacogSections.length === 0) {
+			this.sidebarBodyEl.empty();
+			this.sidebarBodyEl.innerHTML = '<div class="nr-sidebar-loading"><span class="nr-spinner"></span><p>Identifying knowledge sections…</p></div>';
+			try {
+				this.metacogSections = await groupFeedbackIntoSections(
+					this.feedbackItems, studentNotes, this.generatedMarkdown, apiKey
+				);
+			} catch (e) {
+				this.sidebarBodyEl.empty();
+				this.sidebarBodyEl.createEl("p", { text: `Section analysis failed: ${(e as Error).message}`, cls: "nr-sidebar-error" });
+				return;
+			}
+		}
+		this.metacogUserScores = new Array(this.metacogSections.length).fill(0);
+		this.renderMetacognitionRating();
+	}
+
+	private renderMetacognitionRating() {
+		this.sidebarBodyEl.empty();
+		this.sidebarBodyEl.createEl("p", {
+			text: "Rate how well YOU covered each topic, then compare with the AI.",
+			cls: "nr-sidebar-intro",
+		});
+
+		this.metacogSections.forEach((section, i) => {
+			const card = this.sidebarBodyEl.createDiv("nr-metacog-card");
+			card.createEl("h4", { text: section.title, cls: "nr-metacog-section-title" });
+
+			if (section.studentExcerpt) {
+				card.createEl("p", { text: `"${section.studentExcerpt}"`, cls: "nr-metacog-excerpt" });
+			} else {
+				card.createEl("p", { text: "Nothing written about this topic.", cls: "nr-placeholder" });
+			}
+
+			card.createEl("p", { text: "Your rating:", cls: "nr-metacog-rating-label" });
+			const row = card.createDiv("nr-metacog-rating-row");
+			for (let n = 1; n <= 10; n++) {
+				const btn = row.createEl("button", { text: String(n), cls: "nr-rating-btn" });
+				btn.addEventListener("click", () => {
+					this.metacogUserScores[i] = n;
+					row.querySelectorAll(".nr-rating-btn").forEach((b, bi) => b.toggleClass("nr-rating-selected", bi < n));
+					compareBtn.disabled = this.metacogUserScores.some((s) => s === 0);
+				});
+			}
+		});
+
+		const compareBtn = this.sidebarBodyEl.createEl("button", {
+			text: "Compare with AI →",
+			cls: "nr-metacog-compare-btn",
+		});
+		compareBtn.disabled = true;
+		compareBtn.addEventListener("click", () => this.runMetacognitionComparison(compareBtn));
+	}
+
+	private async runMetacognitionComparison(compareBtn: HTMLButtonElement) {
+		compareBtn.disabled = true;
+		compareBtn.setText("Analyzing…");
+		const apiKey = this.plugin.settings.groqApiKey;
+		let feedback: string[];
+		try {
+			feedback = await generateComparisonFeedback(this.metacogSections, this.feedbackItems, this.metacogUserScores, apiKey);
+		} catch {
+			feedback = this.metacogSections.map(() => "Could not generate feedback.");
+		}
+		this.renderMetacognitionResults(feedback);
+	}
+
+	private renderMetacognitionResults(feedback: string[]) {
+		this.sidebarBodyEl.empty();
+
+		const topRow = this.sidebarBodyEl.createDiv("nr-sidebar-summary");
+		topRow.createEl("span", { text: "Self-assessment vs AI", cls: "nr-sidebar-count" });
+		const recheckBtn = topRow.createEl("button", { text: "↻ Recheck", cls: "nr-sidebar-recheck-btn" });
+		recheckBtn.addEventListener("click", () => this.recheckAll());
+
+		const byId = new Map(this.feedbackItems.map(f => [f.id, f]));
+
+		this.metacogSections.forEach((section, i) => {
+			const userScore = this.metacogUserScores[i];
+			const aiScore   = section.aiScore;
+			const gap       = userScore - aiScore;
+			const gapClass  = gap > 2 ? "nr-gap-over" : gap < -2 ? "nr-gap-under" : "nr-gap-ok";
+
+			const card = this.sidebarBodyEl.createDiv("nr-metacog-card nr-metacog-result");
+			card.createEl("h4", { text: section.title, cls: "nr-metacog-section-title" });
+
+			const scores = card.createDiv("nr-metacog-scores");
+			scores.createEl("span", { text: `You: ${userScore}/10`, cls: "nr-score-user"          });
+			scores.createEl("span", { text: "·",                    cls: "nr-score-sep"            });
+			scores.createEl("span", { text: `AI: ${aiScore}/10`,    cls: `nr-score-ai ${gapClass}` });
+
+			card.createEl("p", { text: feedback[i] ?? "", cls: "nr-metacog-feedback" });
+
+			if (section.feedbackIds.length > 0) {
+				const issuesWrap = card.createDiv("nr-metacog-issues-wrap");
+				issuesWrap.style.display = "none";
+
+				const giveUpBtn = card.createEl("button", {
+					text: "Give up — show issues",
+					cls: "nr-giveup-btn",
+				});
+
+				giveUpBtn.addEventListener("click", () => {
+					this.metacogGivenUpSections.add(i);
+					giveUpBtn.style.display = "none";
+					issuesWrap.style.display = "block";
+
+					// Reveal highlights for all given-up sections
+					this.applyMetacogRevealedHighlights();
+
+					const typeLabel: Record<string, string> = {
+						incomplete: "Expand this",
+						missing:    "Add this concept",
+						incorrect:  "Incorrect",
+						verbose:    "Too verbose",
+						unclear:    "Rewrite clearly",
+					};
+
+					section.feedbackIds.forEach(id => {
+						const item = byId.get(id);
+						if (!item) return;
+						const row = issuesWrap.createDiv("nr-metacog-issue-row");
+						row.createEl("span", {
+							text: typeLabel[item.type] ?? item.type,
+							cls: `nr-type-badge nr-type-${item.type}`,
+						});
+						if (item.studentText) {
+							row.createEl("span", {
+								text: ` "${item.studentText.slice(0, 60)}${item.studentText.length > 60 ? "…" : ""}"`,
+								cls: "nr-metacog-issue-quote",
+							});
+						}
+					});
+				});
+			}
+		});
+	}
+
+	private async recheckAll() {
+		const studentNotes = this.cmEditor.state.doc.toString().trim();
+		const apiKey = this.plugin.settings.groqApiKey;
+		if (!studentNotes || !apiKey) return;
+
+		this.feedbackItems    = [];
+		this.metacogSections  = [];
+		this.metacogGivenUpSections = new Set();
+		this.clearHighlights();
+
+		this.sidebarBodyEl.empty();
+		this.sidebarBodyEl.innerHTML = '<div class="nr-sidebar-loading"><span class="nr-spinner"></span><p>Running feedback analysis…</p></div>';
+
+		try {
+			const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
+			this.feedbackItems = raw.map((item, i) => {
+				const id = `f${i}`;
+				let from = 0, to = 0;
+				if (item.studentText) {
+					const idx = studentNotes.indexOf(item.studentText);
+					if (idx !== -1) { from = idx; to = idx + item.studentText.length; }
+				}
+				return { ...item, id, from, to };
+			});
+		} catch (e) {
+			this.sidebarBodyEl.createEl("p", { text: `Recheck failed: ${(e as Error).message}`, cls: "nr-sidebar-error" });
+			return;
+		}
+
+		await this.loadMetacognitionSections(studentNotes, apiKey);
+	}
+
+	private closeSidebar() {
+		this.mode = "normal";
+		this.sidebarEl.style.display = "none";
+		this.metacogBtn.removeClass("nr-mode-active");
+		// Restore feedback highlights if available
+		if (this.feedbackItems.length > 0) this.applyHighlights();
+	}
+
+	// ── Recording ─────────────────────────────────────────────────────────────
 
 	private async toggleRecording() {
 		this.isRecording ? await this.stopRecording() : await this.startRecording();
@@ -356,17 +707,12 @@ export class RecorderView extends ItemView {
 			const mics = devices.filter((d) => d.kind === "audioinput");
 			const prev = this.micSelect.value;
 			this.micSelect.empty();
-			if (mics.length === 0) {
-				this.micSelect.createEl("option", { text: "No microphones found", value: "" });
-				return;
-			}
+			if (mics.length === 0) { this.micSelect.createEl("option", { text: "No microphones found", value: "" }); return; }
 			for (const mic of mics) {
 				const label = mic.label || `Microphone ${this.micSelect.options.length + 1}`;
 				this.micSelect.createEl("option", { text: label, value: mic.deviceId });
 			}
-			if (prev && [...this.micSelect.options].some((o) => o.value === prev)) {
-				this.micSelect.value = prev;
-			}
+			if (prev && [...this.micSelect.options].some((o) => o.value === prev)) this.micSelect.value = prev;
 		} catch { /* permission not yet granted */ }
 	}
 
@@ -379,11 +725,11 @@ export class RecorderView extends ItemView {
 			const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
 
 			this.populateMicList();
-			this.mediaRecorder = new MediaRecorder(stream);
-			this.audioChunks = [];
-			this.transcript = "";
+			this.mediaRecorder  = new MediaRecorder(stream);
+			this.audioChunks    = [];
+			this.transcript     = "";
 			this.generatedMarkdown = "";
-			this.seconds = 0;
+			this.seconds        = 0;
 			this.errorEl.style.display = "none";
 			this.savedVaultPath = null;
 			this.audioPlaybackEl.style.display = "none";
@@ -392,18 +738,24 @@ export class RecorderView extends ItemView {
 			this.aiNotesEl.empty();
 			this.aiNotesEl.createEl("p", { text: "AI-generated notes will appear here after recording stops.", cls: "nr-placeholder" });
 			this.aiNotesStatusEl.empty();
-			this.saveBtn.disabled = true;
+			this.saveBtn.disabled     = true;
 			this.feedbackBtn.disabled = true;
 			this.feedbackBtn.setText("Get Feedback");
-			this.feedbackBtn.onclick = () => this.runFeedback();
+			this.metacogBtn.disabled  = true;
 			this.clearHighlights();
+			this.closeSidebar();
+			this.feedbackItems   = [];
+			this.metacogSections = [];
+			this.metacogGivenUpSections = new Set();
+			this.quizQuestions = [];
+			this.quizQuestionsEl.empty();
+			this.newQuestionsBtn.style.display = "none";
+			this.quizStatusEl.empty();
+			this.quizStatusEl.createEl("p", { text: "Record a lecture first, then come back here to quiz yourself.", cls: "nr-placeholder" });
 
-			this.mediaRecorder.ondataavailable = (e) => {
-				if (e.data.size > 0) this.audioChunks.push(e.data);
-			};
+			this.mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) this.audioChunks.push(e.data); };
 			this.mediaRecorder.start();
 			this.isRecording = true;
-
 			this.recordBtn.addClass("nr-recording");
 			this.recordBtn.innerHTML = '<span class="nr-dot"></span> Stop Recording';
 			this.timerEl.style.display = "flex";
@@ -424,10 +776,7 @@ export class RecorderView extends ItemView {
 			this.mediaRecorder.stop();
 			this.mediaRecorder.stream.getTracks().forEach((t) => t.stop());
 		}
-		if (this.timerInterval !== null) {
-			window.clearInterval(this.timerInterval);
-			this.timerInterval = null;
-		}
+		if (this.timerInterval !== null) { window.clearInterval(this.timerInterval); this.timerInterval = null; }
 		this.recordBtn.removeClass("nr-recording");
 		this.recordBtn.innerHTML = '<span class="nr-dot"></span> Start Recording';
 		this.timerEl.style.display = "none";
@@ -436,7 +785,6 @@ export class RecorderView extends ItemView {
 	private async processRecording() {
 		const blob = new Blob(this.audioChunks, { type: "audio/webm" });
 
-		// Playback
 		const url = URL.createObjectURL(blob);
 		this.audioPlaybackEl.empty();
 		this.audioPlaybackEl.createEl("p", { text: "Temp Playback", cls: "nr-playback-label" });
@@ -445,25 +793,20 @@ export class RecorderView extends ItemView {
 		audio.controls = true;
 		this.audioPlaybackEl.style.display = "block";
 
-		// [TEST MODE] — set TEST_MODE=false in sample-data.ts to use real Groq API
 		if (TEST_MODE) {
-			this.transcript = SAMPLE_TRANSCRIPT;
+			this.transcript        = SAMPLE_TRANSCRIPT;
 			this.generatedMarkdown = SAMPLE_AI_NOTES;
 			this.transcriptEl.setText(this.transcript);
 			await MarkdownRenderer.render(this.app, this.generatedMarkdown, this.aiNotesEl, "", this);
-			this.saveBtn.disabled = false;
+			this.saveBtn.disabled     = false;
 			this.feedbackBtn.disabled = false;
+			this.metacogBtn.disabled  = false;
 			return;
 		}
-		// [/TEST MODE]
 
 		const apiKey = this.plugin.settings.groqApiKey;
-		if (!apiKey) {
-			this.showError("No Groq API key. Add it in Settings → NoteReal.");
-			return;
-		}
+		if (!apiKey) { this.showError("No Groq API key. Add it in Settings → NoteReal."); return; }
 
-		// Transcribe
 		this.aiNotesStatusEl.setText("Transcribing…");
 		this.transcriptEl.empty();
 		try {
@@ -475,101 +818,116 @@ export class RecorderView extends ItemView {
 			return;
 		}
 
-		// Generate notes
 		this.aiNotesStatusEl.innerHTML = '<span class="nr-spinner"></span> Generating notes…';
 		this.aiNotesEl.empty();
 		try {
 			this.generatedMarkdown = await generateNotes(this.transcript, apiKey);
 			this.aiNotesStatusEl.empty();
 			await MarkdownRenderer.render(this.app, this.generatedMarkdown, this.aiNotesEl, "", this);
-			this.saveBtn.disabled = false;
+			this.saveBtn.disabled     = false;
 			this.feedbackBtn.disabled = false;
+			this.metacogBtn.disabled  = false;
 		} catch (e) {
 			this.showError(`Note generation failed: ${(e as Error).message}`);
 			this.aiNotesStatusEl.empty();
 		}
 	}
 
-	// ── Feedback ──────────────────────────────────────────────────────────────
+	// ── Quiz ──────────────────────────────────────────────────────────────────
 
-	private async runFeedback() {
-		const studentNotes = this.cmEditor.state.doc.toString().trim();
-		if (!studentNotes) {
-			this.showError("Write some notes first before getting feedback.");
-			return;
-		}
-		if (!this.generatedMarkdown) {
-			this.showError("No AI notes yet — record a lecture first.");
-			return;
-		}
-
+	private async generateQuestions() {
 		const apiKey = this.plugin.settings.groqApiKey;
-		if (!apiKey) {
-			this.showError("No Groq API key. Add it in Settings → NoteReal.");
-			return;
-		}
+		if (!apiKey) { this.showError("No Groq API key."); return; }
 
-		this.feedbackBtn.disabled = true;
-		this.feedbackBtn.setText("Analyzing…");
-		this.clearHighlights();
+		this.quizQuestionsEl.empty();
+		this.quizStatusEl.empty();
+		this.quizStatusEl.innerHTML = '<span class="nr-spinner"></span> Generating questions…';
+		this.newQuestionsBtn.disabled = true;
+		this.newQuestionsBtn.style.display = "";
 
 		try {
-			const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
-
-			this.feedbackItems = raw.map((item, i) => {
-				const id = `f${i}`;
-				let from = 0, to = 0;
-				if (item.studentText) {
-					const idx = studentNotes.indexOf(item.studentText);
-					if (idx !== -1) { from = idx; to = idx + item.studentText.length; }
-				}
-				return { ...item, id, from, to };
-			});
-
-			this.applyHighlights();
-			const count = this.feedbackItems.filter(f => f.from < f.to).length;
-			new Notice(`${count} issue${count !== 1 ? "s" : ""} highlighted — click any underlined text to see feedback.`);
-
-			// Reveal legend once feedback has run
-			const legend = this.containerEl.querySelector("#nr-legend") as HTMLElement | null;
-			if (legend) legend.style.display = "flex";
+			this.quizQuestions = await generateQuizQuestions(this.transcript, this.generatedMarkdown, apiKey);
+			this.quizStatusEl.empty();
+			this.renderQuizQuestions();
 		} catch (e) {
-			this.showError(`Feedback failed: ${(e as Error).message}`);
+			this.quizStatusEl.empty();
+			this.showError(`Quiz generation failed: ${(e as Error).message}`);
 		} finally {
-			this.feedbackBtn.disabled = false;
-			this.feedbackBtn.setText("Save & Re-check");
-			this.feedbackBtn.onclick = async () => {
-				await this.saveToVault();
-				this.feedbackBtn.onclick = () => this.runFeedback();
-				await this.runFeedback();
-			};
+			this.newQuestionsBtn.disabled = false;
 		}
 	}
 
-	private openFeedbackPopup(id: string) {
-		const item = this.feedbackItems.find((f) => f.id === id);
-		if (!item) return;
-		new FeedbackModal(this.app, item, this.plugin.settings.groqApiKey).open();
+	private renderQuizQuestions() {
+		this.quizQuestionsEl.empty();
+		const sections: { type: QuizQuestion["type"]; icon: string; label: string }[] = [
+			{ type: "explain", icon: "🧒", label: "Explain Simply" },
+			{ type: "whatif",  icon: "🤔", label: "What If?"       },
+			{ type: "quiz",    icon: "✏️", label: "Quiz"            },
+		];
+		for (const { type, icon, label } of sections) {
+			const qs = this.quizQuestions.filter((q) => q.type === type);
+			if (!qs.length) continue;
+			const section = this.quizQuestionsEl.createDiv("nr-quiz-section");
+			section.createEl("h4", { text: `${icon}  ${label}`, cls: "nr-quiz-section-title" });
+			for (const q of qs) this.renderQuestionCard(section, q);
+		}
 	}
 
-	private applyHighlights() {
-		const highlights = this.feedbackItems
-			.filter((item) => item.from < item.to)
-			.map(({ from, to, id, type }) => ({ from, to, id, type }));
-		this.cmEditor.dispatch({ effects: setHighlights.of(highlights) });
-	}
+	private renderQuestionCard(parent: HTMLElement, q: QuizQuestion) {
+		const card = parent.createDiv("nr-quiz-card");
+		card.createEl("p", { text: q.question, cls: "nr-quiz-question" });
+		const textarea = card.createEl("textarea", {
+			cls: "nr-quiz-answer",
+			attr: { placeholder: "Write your answer here…" },
+		}) as HTMLTextAreaElement;
 
-	private clearHighlights() {
-		this.cmEditor.dispatch({ effects: setHighlights.of([]) });
+		const actions   = card.createDiv("nr-quiz-actions");
+		const checkBtn  = actions.createEl("button", { text: "Check Answer",       cls: "nr-quiz-check-btn"  });
+		const revealBtn = actions.createEl("button", { text: "Show Sample Answer", cls: "nr-quiz-reveal-btn" });
+
+		const sampleEl = card.createDiv("nr-quiz-sample");
+		sampleEl.createEl("p", { text: "Sample Answer", cls: "nr-quiz-sample-label" });
+		sampleEl.createEl("p", { text: q.sampleAnswer,  cls: "nr-quiz-sample-text"  });
+		sampleEl.style.display = "none";
+
+		const feedbackEl = card.createDiv("nr-quiz-feedback");
+		feedbackEl.style.display = "none";
+
+		checkBtn.addEventListener("click", async () => {
+			if (!textarea.value.trim()) return;
+			checkBtn.disabled = true;
+			checkBtn.setText("Checking…");
+			feedbackEl.style.display = "none";
+			try {
+				const result = await evaluateAnswer(q, textarea.value.trim(), this.transcript, this.plugin.settings.groqApiKey);
+				const labels: Record<string, string> = { good: "✓  Good", partial: "◐  Partial", "needs-work": "✗  Needs work" };
+				feedbackEl.empty();
+				feedbackEl.setAttribute("class", `nr-quiz-feedback nr-quiz-fb-${result.score}`);
+				feedbackEl.createEl("strong", { text: labels[result.score] + "  " });
+				feedbackEl.createEl("span", { text: result.feedback });
+				feedbackEl.style.display = "block";
+			} catch (e) {
+				this.showError(`Evaluation failed: ${(e as Error).message}`);
+			} finally {
+				checkBtn.disabled = false;
+				checkBtn.setText("Check Answer");
+			}
+		});
+
+		revealBtn.addEventListener("click", () => {
+			const shown = sampleEl.style.display !== "none";
+			sampleEl.style.display = shown ? "none" : "block";
+			revealBtn.setText(shown ? "Show Sample Answer" : "Hide Sample Answer");
+		});
 	}
 
 	// ── Save ──────────────────────────────────────────────────────────────────
 
 	private async saveToVault() {
-		const now = new Date();
+		const now     = new Date();
 		const dateStr = now.toISOString().split("T")[0];
 		const timeStr = now.toTimeString().slice(0, 5).replace(":", "-");
-		const folder = this.plugin.settings.saveFolder.trim().replace(/\/$/, "");
+		const folder  = this.plugin.settings.saveFolder.trim().replace(/\/$/, "");
 
 		if (!this.savedVaultPath) {
 			const baseName = `Lecture Notes ${dateStr} ${timeStr}`;
@@ -578,29 +936,19 @@ export class RecorderView extends ItemView {
 
 		const content = [
 			`# ${this.savedVaultPath.split("/").pop()?.replace(".md", "") ?? "Lecture Notes"}`,
-			`*Recorded: ${now.toLocaleString()}*`,
-			"",
-			"## AI Generated Notes",
-			"",
-			this.generatedMarkdown.trim() || "*No notes generated.*",
-			"",
-			"---",
-			"",
-			"## Transcript",
-			"",
-			this.transcript.trim() || "*No transcript available.*",
-			"",
-			"---",
-			"",
-			"## My Notes",
-			"",
+			`*Recorded: ${now.toLocaleString()}*`, "",
+			"## AI Generated Notes", "",
+			this.generatedMarkdown.trim() || "*No notes generated.*", "",
+			"---", "",
+			"## Transcript", "",
+			this.transcript.trim() || "*No transcript available.*", "",
+			"---", "",
+			"## My Notes", "",
 			this.cmEditor.state.doc.toString(),
 		].join("\n");
 
 		try {
-			if (folder && !(await this.app.vault.adapter.exists(folder))) {
-				await this.app.vault.createFolder(folder);
-			}
+			if (folder && !(await this.app.vault.adapter.exists(folder))) await this.app.vault.createFolder(folder);
 			const exists = await this.app.vault.adapter.exists(this.savedVaultPath);
 			if (exists) {
 				const file = this.app.vault.getAbstractFileByPath(this.savedVaultPath);
@@ -621,7 +969,7 @@ export class RecorderView extends ItemView {
 	// ── Helpers ───────────────────────────────────────────────────────────────
 
 	private updateWordCount() {
-		const text = this.cmEditor.state.doc.toString().trim();
+		const text  = this.cmEditor.state.doc.toString().trim();
 		const count = text === "" ? 0 : text.split(/\s+/).length;
 		this.wordCountEl.setText(`${count} ${count === 1 ? "word" : "words"}`);
 	}
@@ -632,7 +980,7 @@ export class RecorderView extends ItemView {
 	}
 
 	private formatTime(s: number): string {
-		const m = String(Math.floor(s / 60)).padStart(2, "0");
+		const m   = String(Math.floor(s / 60)).padStart(2, "0");
 		const sec = String(s % 60).padStart(2, "0");
 		return `${m}:${sec}`;
 	}
