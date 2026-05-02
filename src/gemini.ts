@@ -36,12 +36,92 @@ export async function generateFeedback(
 	aiNotes: string,
 	apiKey: string
 ): Promise<Omit<FeedbackItem, "id" | "from" | "to">[]> {
-	// Two focused calls in parallel — one per concern
 	const [confusionItems, knowledgeItems] = await Promise.all([
 		detectConfusion(studentNotes, apiKey),
 		checkKnowledge(studentNotes, aiNotes, apiKey),
 	]);
 	return [...confusionItems, ...knowledgeItems];
+}
+
+export async function recheckFeedback(
+	prevNotes: string,
+	currNotes: string,
+	aiNotes: string,
+	apiKey: string
+): Promise<Omit<FeedbackItem, "id" | "from" | "to">[]> {
+	const prevSet = new Set(prevNotes.split('\n').map(l => l.trim()).filter(Boolean));
+	const changed = currNotes.split('\n').map(l => l.trim()).filter(l => l && !prevSet.has(l)).join('\n');
+
+	// Nothing changed — run full feedback so the student can't game it by not editing
+	if (!changed) return generateFeedback(currNotes, aiNotes, apiKey);
+
+	const [confusionItems, knowledgeItems] = await Promise.all([
+		recheckConfusion(changed, currNotes, apiKey),
+		recheckKnowledge(changed, currNotes, aiNotes, apiKey),
+	]);
+	return [...confusionItems, ...knowledgeItems];
+}
+
+async function recheckConfusion(
+	changedText: string,
+	fullNotes: string,
+	apiKey: string
+): Promise<Omit<FeedbackItem, "id" | "from" | "to">[]> {
+	const text = await groqChat(apiKey, `The student revised their notes. Check ONLY the revised text for confusion, uncertainty, sloppiness, or unclear writing. Ignore unchanged content.
+
+Revised text:
+${changedText}
+
+Full notes (context only — do not flag things outside the revised text):
+${fullNotes}
+
+Return ONLY a raw JSON array — no markdown, no explanation:
+[
+  {
+    "studentText": "exact phrase from the revised text that has the problem",
+    "question": "Socratic question making the student realise the problem",
+    "hints": ["gentle nudge", "more direct", "almost gives it away"],
+    "answer": "what is wrong and what to write instead",
+    "type": "unclear"
+  }
+]
+If nothing in the revised text is problematic, return [].`);
+
+	const clean = text.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
+	try { return JSON.parse(clean); } catch { return []; }
+}
+
+async function recheckKnowledge(
+	changedText: string,
+	fullNotes: string,
+	aiNotes: string,
+	apiKey: string
+): Promise<Omit<FeedbackItem, "id" | "from" | "to">[]> {
+	const text = await groqChat(apiKey, `The student revised their notes. Evaluate ONLY the revised text against the reference — is it accurate, complete, and appropriately detailed?
+
+Revised text to evaluate:
+${changedText}
+
+Full notes (context only — do not flag things outside the revised text):
+${fullNotes}
+
+Reference notes:
+${aiNotes}
+
+Return ONLY a raw JSON array — no markdown fences, no explanation:
+[
+  {
+    "studentText": "exact phrase from the revised text, or empty string if something is still missing",
+    "question": "Socratic question nudging them toward the issue",
+    "hints": ["subtle nudge", "more direct", "almost gives it away"],
+    "answer": "what is wrong and why it matters",
+    "type": "missing|incorrect|incomplete|verbose"
+  }
+]
+If the revised text is accurate and complete, return [].`);
+
+	const clean = text.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
+	try { return JSON.parse(clean); } catch { return []; }
 }
 
 async function detectConfusion(

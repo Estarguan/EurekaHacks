@@ -5,11 +5,11 @@ import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { bracketMatching, indentOnInput, syntaxHighlighting, HighlightStyle } from "@codemirror/language";
 import { markdown } from "@codemirror/lang-markdown";
 import { tags } from "@lezer/highlight";
-import type NoteRealPlugin from "./main";
-import { transcribeAudio, generateNotes, generateFeedback, generateNextHint, generateQuizQuestions, evaluateAnswer, groupFeedbackIntoSections, generateComparisonFeedback, FeedbackItem, QuizQuestion, MetacognitionSection } from "./gemini";
+import type DidYouEvenListenPlugin from "./main";
+import { transcribeAudio, generateNotes, generateFeedback, recheckFeedback, generateNextHint, generateQuizQuestions, evaluateAnswer, groupFeedbackIntoSections, generateComparisonFeedback, FeedbackItem, QuizQuestion, MetacognitionSection } from "./gemini";
 import { TEST_MODE, SAMPLE_TRANSCRIPT, SAMPLE_AI_NOTES } from "./sample-data";
 
-export const RECORDER_VIEW_TYPE = "notereal-recorder";
+export const RECORDER_VIEW_TYPE = "didyouevenlisten-recorder";
 
 // ── CodeMirror highlight decoration ──────────────────────────────────────────
 
@@ -39,11 +39,14 @@ const highlightField = StateField.define<DecorationSet>({
 class FeedbackModal extends Modal {
 	private item: FeedbackItem;
 	private apiKey: string;
+	private onGiveUp?: () => void;
+	private didGiveUp = false;
 
-	constructor(app: Parameters<typeof Modal.prototype.constructor>[0], item: FeedbackItem, apiKey: string) {
+	constructor(app: Parameters<typeof Modal.prototype.constructor>[0], item: FeedbackItem, apiKey: string, onGiveUp?: () => void) {
 		super(app);
 		this.item = item;
 		this.apiKey = apiKey;
+		this.onGiveUp = onGiveUp;
 	}
 
 	onOpen() {
@@ -134,10 +137,14 @@ class FeedbackModal extends Modal {
 			answerEl.style.display = "block";
 			giveUpBtn.style.display = "none";
 			hintBtn.style.display = "none";
+			this.didGiveUp = true;
 		});
 	}
 
-	onClose() { this.contentEl.empty(); }
+	onClose() {
+		this.contentEl.empty();
+		if (this.didGiveUp) this.onGiveUp?.();
+	}
 }
 
 // ── Markdown highlight style ──────────────────────────────────────────────────
@@ -177,7 +184,7 @@ const obsidianEditorTheme = EditorView.theme({
 // ── View ──────────────────────────────────────────────────────────────────────
 
 export class RecorderView extends ItemView {
-	plugin: NoteRealPlugin;
+	plugin: DidYouEvenListenPlugin;
 
 	private mediaRecorder: MediaRecorder | null = null;
 	private audioChunks: Blob[] = [];
@@ -222,19 +229,27 @@ export class RecorderView extends ItemView {
 	private brainScore = 0;
 	private headerBrainEl!: HTMLImageElement;
 
-	constructor(leaf: WorkspaceLeaf, plugin: NoteRealPlugin) {
+	// Hover tooltip
+	private tooltipEl!: HTMLElement;
+
+	// Snapshot of notes at last feedback run — used for recheck diffing
+	private prevStudentNotes = "";
+
+	constructor(leaf: WorkspaceLeaf, plugin: DidYouEvenListenPlugin) {
 		super(leaf);
 		this.plugin = plugin;
 	}
 
 	getViewType() { return RECORDER_VIEW_TYPE; }
-	getDisplayText() { return "NoteReal"; }
+	getDisplayText() { return "Did You Even Listen"; }
 	getIcon() { return "mic"; }
 
 	async onOpen() {
 		const container = this.containerEl.children[1] as HTMLElement;
 		container.empty();
 		container.addClass("nr-container");
+
+		this.tooltipEl = container.createDiv("nr-hover-tooltip");
 
 		// Splash screen
 		const splash = container.createDiv("nr-splash");
@@ -246,20 +261,23 @@ export class RecorderView extends ItemView {
 		splash.addEventListener("click", () => {
 			splash.addClass("nr-splash-exit");
 			splash.addEventListener("transitionend", () => splash.remove(), { once: true });
+			setTimeout(() => main.removeClass("nr-main-hidden"), 100);
 		});
 
+		const main = container.createDiv("nr-main nr-main-hidden");
+
 		// Header
-		const header = container.createDiv("nr-header");
+		const header = main.createDiv("nr-header");
 		const headerBrainSrc = this.app.vault.adapter.getResourcePath(
 			`${this.plugin.manifest.dir}/assets/neutralBrain.png`
 		);
 		this.headerBrainEl = header.createEl("img", { cls: "nr-header-brain", attr: { src: headerBrainSrc, draggable: "false" } }) as HTMLImageElement;
 		const titleRow = header.createDiv("nr-title-row");
-		titleRow.createEl("span", { text: "NoteReal", cls: "nr-title" });
+		titleRow.createEl("span", { text: "Did You Even Listen", cls: "nr-title" });
 		header.createEl("p", { text: "Sometimes to take two steps forward you need to take one step back.", cls: "nr-slogan" });
 
 		// Record bar
-		const recBar = container.createDiv("nr-rec-bar");
+		const recBar = main.createDiv("nr-rec-bar");
 		this.recordBtn = recBar.createEl("button", { cls: "nr-record-btn" });
 		this.recordBtn.innerHTML = '<span class="nr-dot"></span> Start Recording';
 		this.recordBtn.addEventListener("click", () => this.toggleRecording());
@@ -273,17 +291,21 @@ export class RecorderView extends ItemView {
 		this.timerEl.style.display = "none";
 
 		// Error bar
-		this.errorEl = container.createDiv("nr-error");
+		this.errorEl = main.createDiv("nr-error");
 		this.errorEl.style.display = "none";
 
 		// Tab bar
-		const tabBar = container.createDiv("nr-tab-bar");
+		const tabBar = main.createDiv("nr-tab-bar");
 		const recordTab = tabBar.createEl("button", { text: "Record", cls: "nr-tab nr-tab-active" });
 		const reviewTab = tabBar.createEl("button", { text: "Review", cls: "nr-tab" });
 		const quizTab   = tabBar.createEl("button", { text: "Quiz",   cls: "nr-tab" });
 
+		// ── Pane slider ───────────────────────────────────────────────
+		const paneTrack = main.createDiv("nr-pane-track");
+		const paneSlider = paneTrack.createDiv("nr-pane-slider");
+
 		// ── Record pane ───────────────────────────────────────────────
-		const recordPane = container.createDiv("nr-pane nr-pane-active");
+		const recordPane = paneSlider.createDiv("nr-pane");
 		const recordMain = recordPane.createDiv("nr-record-main");
 
 		const editorArea = recordMain.createDiv("nr-editor-area");
@@ -322,6 +344,55 @@ export class RecorderView extends ItemView {
 			if (cls) this.openFeedbackPopup(cls.replace("nr-hl-", ""));
 		});
 
+		// Hover highlight → show tooltip card
+		const typeLabel: Record<string, string> = {
+			incomplete: "Expand this",
+			missing:    "Add this concept",
+			incorrect:  "Incorrect",
+			verbose:    "Too verbose — shorten",
+			unclear:    "Rewrite clearly",
+		};
+
+		this.cmEditor.dom.addEventListener("mouseover", (e) => {
+			const target = e.target as HTMLElement;
+			const hl = target.closest('[class*="nr-hl-f"]') as HTMLElement | null;
+			if (!hl) { this.tooltipEl.style.display = "none"; return; }
+			const cls = [...hl.classList].find(c => c.startsWith("nr-hl-f"));
+			if (!cls) return;
+			const item = this.feedbackItems.find(f => f.id === cls.replace("nr-hl-", ""));
+			if (!item) return;
+
+			this.tooltipEl.empty();
+			this.tooltipEl.createEl("span", {
+				text: typeLabel[item.type] ?? item.type,
+				cls: `nr-tooltip-badge nr-type-${item.type}`,
+			});
+			this.tooltipEl.createEl("p", { text: item.question, cls: "nr-tooltip-question" });
+
+			// Measure before positioning
+			this.tooltipEl.style.visibility = "hidden";
+			this.tooltipEl.style.display = "block";
+
+			const rect  = hl.getBoundingClientRect();
+			const cRect = container.getBoundingClientRect();
+			const tw = this.tooltipEl.offsetWidth;
+			const th = this.tooltipEl.offsetHeight;
+
+			let top  = rect.top  - cRect.top  - th - 8;
+			let left = rect.left - cRect.left;
+
+			if (top < 0) top = rect.bottom - cRect.top + 8;
+			left = Math.min(Math.max(4, left), cRect.width - tw - 4);
+
+			this.tooltipEl.style.top  = `${top}px`;
+			this.tooltipEl.style.left = `${left}px`;
+			this.tooltipEl.style.visibility = "visible";
+		});
+
+		this.cmEditor.dom.addEventListener("mouseleave", () => {
+			this.tooltipEl.style.display = "none";
+		});
+
 		this.wordCountEl = editorArea.createDiv("nr-wordcount");
 		this.wordCountEl.setText("0 words");
 
@@ -354,7 +425,7 @@ export class RecorderView extends ItemView {
 		this.sidebarBodyEl = this.sidebarEl.createDiv("nr-sidebar-body");
 
 		// ── Review pane ───────────────────────────────────────────────
-		const reviewPane = container.createDiv("nr-pane");
+		const reviewPane = paneSlider.createDiv("nr-pane");
 		const reviewPanels = reviewPane.createDiv("nr-panels");
 
 		const transcriptPanel = reviewPanels.createDiv("nr-panel");
@@ -371,7 +442,7 @@ export class RecorderView extends ItemView {
 		this.aiNotesEl.createEl("p", { text: "AI-generated notes will appear here after recording stops.", cls: "nr-placeholder" });
 
 		// ── Quiz pane ─────────────────────────────────────────────────
-		const quizPane = container.createDiv("nr-pane");
+		const quizPane = paneSlider.createDiv("nr-pane");
 		const quizHeader = quizPane.createDiv("nr-quiz-header");
 		quizHeader.createEl("h3", { text: "Quiz Yourself", cls: "nr-panel-title" });
 		this.newQuestionsBtn = quizHeader.createEl("button", { text: "↻ New Questions", cls: "nr-new-questions-btn" });
@@ -384,16 +455,15 @@ export class RecorderView extends ItemView {
 		this.quizQuestionsEl = quizPane.createDiv("nr-quiz-questions");
 
 		// Tab switching
-		const panes = [recordPane, reviewPane, quizPane];
-		const tabs  = [recordTab,  reviewTab,  quizTab];
+		const tabs = [recordTab, reviewTab, quizTab];
 		tabs.forEach((tab, i) => tab.addEventListener("click", () => {
 			tabs.forEach((t, j) => t.toggleClass("nr-tab-active", j === i));
-			panes.forEach((p, j) => p.toggleClass("nr-pane-active", j === i));
+			paneSlider.style.transform = `translateX(-${i * (100 / 3)}%)`;
 			if (i === 2 && this.transcript && this.quizQuestions.length === 0) this.generateQuestions();
 		}));
 
 		// Footer
-		const footer = container.createDiv("nr-footer");
+		const footer = main.createDiv("nr-footer");
 		this.saveBtn = footer.createEl("button", { text: "Save to Vault", cls: "nr-save-btn" });
 		this.saveBtn.disabled = true;
 		this.saveBtn.addEventListener("click", () => this.saveToVault());
@@ -422,8 +492,10 @@ export class RecorderView extends ItemView {
 		if (!studentNotes) { this.showError("Write some notes first before getting feedback."); return; }
 		if (!this.generatedMarkdown) { this.showError("No AI notes yet — record a lecture first."); return; }
 		const apiKey = this.plugin.settings.groqApiKey;
-		if (!apiKey) { this.showError("No Groq API key. Add it in Settings → NoteReal."); return; }
+		if (!apiKey) { this.showError("No Groq API key. Add it in Settings → Did You Even Listen."); return; }
 
+		const prevCount = this.feedbackItems.length;
+		const isRecheck = this.prevStudentNotes !== "";
 		this.feedbackBtn.disabled = true;
 		this.feedbackBtn.setText("Analyzing…");
 		this.clearHighlights();
@@ -432,7 +504,9 @@ export class RecorderView extends ItemView {
 		this.metacogGivenUpSections = new Set();
 
 		try {
-			const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
+			const raw = isRecheck
+				? await recheckFeedback(this.prevStudentNotes, studentNotes, this.generatedMarkdown, apiKey)
+				: await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
 
 			this.feedbackItems = raw.map((item, i) => {
 				const id = `f${i}`;
@@ -444,12 +518,22 @@ export class RecorderView extends ItemView {
 				return { ...item, id, from, to };
 			});
 
+			this.prevStudentNotes = studentNotes;
+
 			this.applyHighlights();
 			const count = this.feedbackItems.filter(f => f.from < f.to).length;
 			new Notice(`${count} issue${count !== 1 ? "s" : ""} highlighted — click any underlined text to see feedback.`);
 
-			if (count >= 5)      { this.brainScore--; this.updateBrainImage(); }
-			else if (count <= 2) { this.brainScore++; this.updateBrainImage(); }
+			if (isRecheck) {
+				if (this.feedbackItems.length < prevCount) {
+					this.triggerBrainEvent('success', 'Nice Change!');
+				} else {
+					this.triggerBrainEvent('fail', 'YOU FAILED.');
+				}
+			} else {
+				if (count >= 5)      { this.brainScore--; this.updateBrainImage(); }
+				else if (count <= 2) { this.brainScore++; this.updateBrainImage(); }
+			}
 
 			const legend = this.containerEl.querySelector("#nr-legend") as HTMLElement | null;
 			if (legend) legend.style.display = "flex";
@@ -471,7 +555,7 @@ export class RecorderView extends ItemView {
 	private openFeedbackPopup(id: string) {
 		const item = this.feedbackItems.find((f) => f.id === id);
 		if (!item) return;
-		new FeedbackModal(this.app, item, this.plugin.settings.groqApiKey).open();
+		new FeedbackModal(this.app, item, this.plugin.settings.groqApiKey, () => this.triggerBrainEvent('fail')).open();
 	}
 
 	private applyHighlights() {
@@ -502,7 +586,7 @@ export class RecorderView extends ItemView {
 		const studentNotes = this.cmEditor.state.doc.toString().trim();
 		if (!studentNotes) { this.showError("Write some notes first before doing a metacognition check."); return; }
 		const apiKey = this.plugin.settings.groqApiKey;
-		if (!apiKey) { this.showError("No Groq API key. Add it in Settings → NoteReal."); return; }
+		if (!apiKey) { this.showError("No Groq API key. Add it in Settings → Did You Even Listen."); return; }
 
 		this.mode = "metacognition";
 		this.metacogUserScores = [];
@@ -564,15 +648,20 @@ export class RecorderView extends ItemView {
 			cls: "nr-sidebar-intro",
 		});
 
-		this.metacogSections.forEach((section, i) => {
+		const covered = this.metacogSections
+			.map((s, i) => ({ s, i }))
+			.filter(({ s }) => !!s.studentExcerpt);
+		const missed = this.metacogSections
+			.map((s, i) => ({ s, i }))
+			.filter(({ s }) => !s.studentExcerpt);
+
+		// Auto-score missed sections low so comparison still runs
+		missed.forEach(({ i }) => { this.metacogUserScores[i] = 1; });
+
+		covered.forEach(({ s: section, i }) => {
 			const card = this.sidebarBodyEl.createDiv("nr-metacog-card");
 			card.createEl("h4", { text: section.title, cls: "nr-metacog-section-title" });
-
-			if (section.studentExcerpt) {
-				card.createEl("p", { text: `"${section.studentExcerpt}"`, cls: "nr-metacog-excerpt" });
-			} else {
-				card.createEl("p", { text: "Nothing written about this topic.", cls: "nr-placeholder" });
-			}
+			card.createEl("p", { text: `"${section.studentExcerpt}"`, cls: "nr-metacog-excerpt" });
 
 			card.createEl("p", { text: "Your rating:", cls: "nr-metacog-rating-label" });
 			const row = card.createDiv("nr-metacog-rating-row");
@@ -581,16 +670,23 @@ export class RecorderView extends ItemView {
 				btn.addEventListener("click", () => {
 					this.metacogUserScores[i] = n;
 					row.querySelectorAll(".nr-rating-btn").forEach((b, bi) => b.toggleClass("nr-rating-selected", bi < n));
-					compareBtn.disabled = this.metacogUserScores.some((s) => s === 0);
+					compareBtn.disabled = covered.some(({ i: ci }) => this.metacogUserScores[ci] === 0);
 				});
 			}
 		});
+
+		if (missed.length > 0) {
+			const missedBox = this.sidebarBodyEl.createDiv("nr-metacog-missed-box");
+			missedBox.createEl("p", { text: "Topics you didn't cover — add these to your notes:", cls: "nr-metacog-missed-label" });
+			const list = missedBox.createEl("ul", { cls: "nr-metacog-missed-list" });
+			missed.forEach(({ s }) => list.createEl("li", { text: s.title }));
+		}
 
 		const compareBtn = this.sidebarBodyEl.createEl("button", {
 			text: "Compare with AI →",
 			cls: "nr-metacog-compare-btn",
 		});
-		compareBtn.disabled = true;
+		compareBtn.disabled = covered.some(({ i }) => this.metacogUserScores[i] === 0);
 		compareBtn.addEventListener("click", () => this.runMetacognitionComparison(compareBtn));
 	}
 
@@ -656,6 +752,7 @@ export class RecorderView extends ItemView {
 
 					// Reveal highlights for all given-up sections
 					this.applyMetacogRevealedHighlights();
+					this.triggerBrainEvent('fail');
 
 					const typeLabel: Record<string, string> = {
 						incomplete: "Expand this",
@@ -694,11 +791,42 @@ export class RecorderView extends ItemView {
 		);
 	}
 
+	private triggerBrainEvent(type: 'fail' | 'success', message?: string) {
+		const asset = type === 'fail' ? 'roastedBrain.png' : 'galaxyBrain.png';
+		this.headerBrainEl.src = this.app.vault.adapter.getResourcePath(
+			`${this.plugin.manifest.dir}/assets/${asset}`
+		);
+		this.headerBrainEl.addClass('nr-brain-pop');
+		this.headerBrainEl.addEventListener('animationend', () => this.headerBrainEl.removeClass('nr-brain-pop'), { once: true });
+
+		const container = this.containerEl.children[1] as HTMLElement;
+		const overlay = container.createDiv(`nr-result-overlay nr-result-${type}`);
+		const brainSrc = this.app.vault.adapter.getResourcePath(
+			`${this.plugin.manifest.dir}/assets/${asset}`
+		);
+		overlay.createEl('img', { cls: 'nr-result-brain', attr: { src: brainSrc, draggable: 'false' } });
+		overlay.createEl('p', {
+			text: message ?? (type === 'fail' ? 'YOU FAILED.' : 'YOU SUCCEEDED!'),
+			cls: 'nr-result-title',
+		});
+		overlay.createEl('p', { text: 'click to continue', cls: 'nr-result-sub' });
+
+		requestAnimationFrame(() => overlay.addClass('nr-result-visible'));
+
+		const dismiss = () => {
+			overlay.removeClass('nr-result-visible');
+			overlay.addEventListener('transitionend', () => overlay.remove(), { once: true });
+		};
+		overlay.addEventListener('click', dismiss);
+		setTimeout(dismiss, 4000);
+	}
+
 	private async recheckAll() {
 		const studentNotes = this.cmEditor.state.doc.toString().trim();
 		const apiKey = this.plugin.settings.groqApiKey;
 		if (!studentNotes || !apiKey) return;
 
+		const prevCount = this.feedbackItems.length;
 		this.feedbackItems    = [];
 		this.metacogSections  = [];
 		this.metacogGivenUpSections = new Set();
@@ -710,7 +838,9 @@ export class RecorderView extends ItemView {
 		this.sidebarBodyEl.innerHTML = '<div class="nr-sidebar-loading"><span class="nr-spinner"></span><p>Running feedback analysis…</p></div>';
 
 		try {
-			const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
+			const raw = this.prevStudentNotes
+				? await recheckFeedback(this.prevStudentNotes, studentNotes, this.generatedMarkdown, apiKey)
+				: await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
 			this.feedbackItems = raw.map((item, i) => {
 				const id = `f${i}`;
 				let from = 0, to = 0;
@@ -720,12 +850,19 @@ export class RecorderView extends ItemView {
 				}
 				return { ...item, id, from, to };
 			});
+			this.prevStudentNotes = studentNotes;
 		} catch (e) {
 			this.sidebarBodyEl.createEl("p", { text: `Recheck failed: ${(e as Error).message}`, cls: "nr-sidebar-error" });
 			return;
 		}
 
 		await this.loadMetacognitionSections(studentNotes, apiKey);
+		const newCount = this.feedbackItems.length;
+		if (newCount < prevCount) {
+			this.triggerBrainEvent('success', 'Nice Change!');
+		} else {
+			this.triggerBrainEvent('fail', 'YOU FAILED.');
+		}
 	}
 
 	private closeSidebar() {
@@ -798,6 +935,7 @@ export class RecorderView extends ItemView {
 			this.mediaRecorder.start();
 			this.isRecording = true;
 			this.recordBtn.addClass("nr-recording");
+			(this.containerEl.children[1] as HTMLElement).addClass("nr-is-recording");
 			this.recordBtn.innerHTML = '<span class="nr-dot"></span> Stop Recording';
 			this.timerEl.style.display = "flex";
 
@@ -812,6 +950,7 @@ export class RecorderView extends ItemView {
 
 	private async stopRecording() {
 		this.isRecording = false;
+		(this.containerEl.children[1] as HTMLElement).removeClass("nr-is-recording");
 		if (this.mediaRecorder) {
 			this.mediaRecorder.onstop = () => this.processRecording();
 			this.mediaRecorder.stop();
@@ -846,7 +985,7 @@ export class RecorderView extends ItemView {
 		}
 
 		const apiKey = this.plugin.settings.groqApiKey;
-		if (!apiKey) { this.showError("No Groq API key. Add it in Settings → NoteReal."); return; }
+		if (!apiKey) { this.showError("No Groq API key. Add it in Settings → Did You Even Listen."); return; }
 
 		this.aiNotesStatusEl.setText("Transcribing…");
 		this.transcriptEl.empty();

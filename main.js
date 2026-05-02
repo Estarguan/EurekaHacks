@@ -19,7 +19,7 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 // src/main.ts
 var main_exports = {};
 __export(main_exports, {
-  default: () => NoteRealPlugin
+  default: () => DidYouEvenListenPlugin
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian2 = require("obsidian");
@@ -5198,6 +5198,73 @@ async function generateFeedback(studentNotes, aiNotes, apiKey) {
   ]);
   return [...confusionItems, ...knowledgeItems];
 }
+async function recheckFeedback(prevNotes, currNotes, aiNotes, apiKey) {
+  const prevSet = new Set(prevNotes.split("\n").map((l) => l.trim()).filter(Boolean));
+  const changed = currNotes.split("\n").map((l) => l.trim()).filter((l) => l && !prevSet.has(l)).join("\n");
+  if (!changed) return generateFeedback(currNotes, aiNotes, apiKey);
+  const [confusionItems, knowledgeItems] = await Promise.all([
+    recheckConfusion(changed, currNotes, apiKey),
+    recheckKnowledge(changed, currNotes, aiNotes, apiKey)
+  ]);
+  return [...confusionItems, ...knowledgeItems];
+}
+async function recheckConfusion(changedText, fullNotes, apiKey) {
+  const text = await groqChat(apiKey, `The student revised their notes. Check ONLY the revised text for confusion, uncertainty, sloppiness, or unclear writing. Ignore unchanged content.
+
+Revised text:
+${changedText}
+
+Full notes (context only \u2014 do not flag things outside the revised text):
+${fullNotes}
+
+Return ONLY a raw JSON array \u2014 no markdown, no explanation:
+[
+  {
+    "studentText": "exact phrase from the revised text that has the problem",
+    "question": "Socratic question making the student realise the problem",
+    "hints": ["gentle nudge", "more direct", "almost gives it away"],
+    "answer": "what is wrong and what to write instead",
+    "type": "unclear"
+  }
+]
+If nothing in the revised text is problematic, return [].`);
+  const clean = text.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
+  try {
+    return JSON.parse(clean);
+  } catch (e) {
+    return [];
+  }
+}
+async function recheckKnowledge(changedText, fullNotes, aiNotes, apiKey) {
+  const text = await groqChat(apiKey, `The student revised their notes. Evaluate ONLY the revised text against the reference \u2014 is it accurate, complete, and appropriately detailed?
+
+Revised text to evaluate:
+${changedText}
+
+Full notes (context only \u2014 do not flag things outside the revised text):
+${fullNotes}
+
+Reference notes:
+${aiNotes}
+
+Return ONLY a raw JSON array \u2014 no markdown fences, no explanation:
+[
+  {
+    "studentText": "exact phrase from the revised text, or empty string if something is still missing",
+    "question": "Socratic question nudging them toward the issue",
+    "hints": ["subtle nudge", "more direct", "almost gives it away"],
+    "answer": "what is wrong and why it matters",
+    "type": "missing|incorrect|incomplete|verbose"
+  }
+]
+If the revised text is accurate and complete, return [].`);
+  const clean = text.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
+  try {
+    return JSON.parse(clean);
+  } catch (e) {
+    return [];
+  }
+}
 async function detectConfusion(studentNotes, apiKey) {
   const text = await groqChat(apiKey, `Read these student notes and flag every moment that strikes you as confused, uncertain, sloppy, or unprofessional. Use your own judgement \u2014 don't hold back. If something feels off, flag it.
 
@@ -5460,7 +5527,7 @@ var SAMPLE_AI_NOTES = `
 `.trim();
 
 // src/recorder-view.ts
-var RECORDER_VIEW_TYPE = "notereal-recorder";
+var RECORDER_VIEW_TYPE = "didyouevenlisten-recorder";
 var setHighlights = import_state4.StateEffect.define();
 var highlightField = import_state4.StateField.define({
   create() {
@@ -5483,10 +5550,12 @@ var highlightField = import_state4.StateField.define({
   provide: (f) => import_view4.EditorView.decorations.from(f)
 });
 var FeedbackModal = class extends import_obsidian.Modal {
-  constructor(app, item, apiKey) {
+  constructor(app, item, apiKey, onGiveUp) {
     super(app);
+    this.didGiveUp = false;
     this.item = item;
     this.apiKey = apiKey;
+    this.onGiveUp = onGiveUp;
   }
   onOpen() {
     var _a, _b;
@@ -5564,10 +5633,13 @@ var FeedbackModal = class extends import_obsidian.Modal {
       answerEl.style.display = "block";
       giveUpBtn.style.display = "none";
       hintBtn.style.display = "none";
+      this.didGiveUp = true;
     });
   }
   onClose() {
+    var _a;
     this.contentEl.empty();
+    if (this.didGiveUp) (_a = this.onGiveUp) == null ? void 0 : _a.call(this);
   }
 };
 var markdownHighlight = import_language5.HighlightStyle.define([
@@ -5616,13 +5688,17 @@ var RecorderView = class extends import_obsidian.ItemView {
     this.metacogSections = [];
     this.metacogUserScores = [];
     this.metacogGivenUpSections = /* @__PURE__ */ new Set();
+    // Brain state
+    this.brainScore = 0;
+    // Snapshot of notes at last feedback run — used for recheck diffing
+    this.prevStudentNotes = "";
     this.plugin = plugin;
   }
   getViewType() {
     return RECORDER_VIEW_TYPE;
   }
   getDisplayText() {
-    return "NoteReal";
+    return "Did You Even Listen";
   }
   getIcon() {
     return "mic";
@@ -5631,6 +5707,7 @@ var RecorderView = class extends import_obsidian.ItemView {
     const container = this.containerEl.children[1];
     container.empty();
     container.addClass("nr-container");
+    this.tooltipEl = container.createDiv("nr-hover-tooltip");
     const splash = container.createDiv("nr-splash");
     const brainSrc = this.app.vault.adapter.getResourcePath(
       `${this.plugin.manifest.dir}/assets/neutralBrain.png`
@@ -5640,16 +5717,18 @@ var RecorderView = class extends import_obsidian.ItemView {
     splash.addEventListener("click", () => {
       splash.addClass("nr-splash-exit");
       splash.addEventListener("transitionend", () => splash.remove(), { once: true });
+      setTimeout(() => main.removeClass("nr-main-hidden"), 100);
     });
-    const header = container.createDiv("nr-header");
+    const main = container.createDiv("nr-main nr-main-hidden");
+    const header = main.createDiv("nr-header");
     const headerBrainSrc = this.app.vault.adapter.getResourcePath(
       `${this.plugin.manifest.dir}/assets/neutralBrain.png`
     );
-    header.createEl("img", { cls: "nr-header-brain", attr: { src: headerBrainSrc, draggable: "false" } });
+    this.headerBrainEl = header.createEl("img", { cls: "nr-header-brain", attr: { src: headerBrainSrc, draggable: "false" } });
     const titleRow = header.createDiv("nr-title-row");
-    titleRow.createEl("span", { text: "NoteReal", cls: "nr-title" });
+    titleRow.createEl("span", { text: "Did You Even Listen", cls: "nr-title" });
     header.createEl("p", { text: "Sometimes to take two steps forward you need to take one step back.", cls: "nr-slogan" });
-    const recBar = container.createDiv("nr-rec-bar");
+    const recBar = main.createDiv("nr-rec-bar");
     this.recordBtn = recBar.createEl("button", { cls: "nr-record-btn" });
     this.recordBtn.innerHTML = '<span class="nr-dot"></span> Start Recording';
     this.recordBtn.addEventListener("click", () => this.toggleRecording());
@@ -5659,13 +5738,15 @@ var RecorderView = class extends import_obsidian.ItemView {
     navigator.mediaDevices.addEventListener("devicechange", () => this.populateMicList());
     this.timerEl = recBar.createDiv("nr-timer");
     this.timerEl.style.display = "none";
-    this.errorEl = container.createDiv("nr-error");
+    this.errorEl = main.createDiv("nr-error");
     this.errorEl.style.display = "none";
-    const tabBar = container.createDiv("nr-tab-bar");
+    const tabBar = main.createDiv("nr-tab-bar");
     const recordTab = tabBar.createEl("button", { text: "Record", cls: "nr-tab nr-tab-active" });
     const reviewTab = tabBar.createEl("button", { text: "Review", cls: "nr-tab" });
     const quizTab = tabBar.createEl("button", { text: "Quiz", cls: "nr-tab" });
-    const recordPane = container.createDiv("nr-pane nr-pane-active");
+    const paneTrack = main.createDiv("nr-pane-track");
+    const paneSlider = paneTrack.createDiv("nr-pane-slider");
+    const recordPane = paneSlider.createDiv("nr-pane");
     const recordMain = recordPane.createDiv("nr-record-main");
     const editorArea = recordMain.createDiv("nr-editor-area");
     editorArea.createEl("h3", { text: "Your Notes", cls: "nr-panel-title" });
@@ -5699,6 +5780,48 @@ var RecorderView = class extends import_obsidian.ItemView {
       const cls = [...hl.classList].find((c) => c.startsWith("nr-hl-f"));
       if (cls) this.openFeedbackPopup(cls.replace("nr-hl-", ""));
     });
+    const typeLabel = {
+      incomplete: "Expand this",
+      missing: "Add this concept",
+      incorrect: "Incorrect",
+      verbose: "Too verbose \u2014 shorten",
+      unclear: "Rewrite clearly"
+    };
+    this.cmEditor.dom.addEventListener("mouseover", (e) => {
+      var _a;
+      const target = e.target;
+      const hl = target.closest('[class*="nr-hl-f"]');
+      if (!hl) {
+        this.tooltipEl.style.display = "none";
+        return;
+      }
+      const cls = [...hl.classList].find((c) => c.startsWith("nr-hl-f"));
+      if (!cls) return;
+      const item = this.feedbackItems.find((f) => f.id === cls.replace("nr-hl-", ""));
+      if (!item) return;
+      this.tooltipEl.empty();
+      this.tooltipEl.createEl("span", {
+        text: (_a = typeLabel[item.type]) != null ? _a : item.type,
+        cls: `nr-tooltip-badge nr-type-${item.type}`
+      });
+      this.tooltipEl.createEl("p", { text: item.question, cls: "nr-tooltip-question" });
+      this.tooltipEl.style.visibility = "hidden";
+      this.tooltipEl.style.display = "block";
+      const rect = hl.getBoundingClientRect();
+      const cRect = container.getBoundingClientRect();
+      const tw = this.tooltipEl.offsetWidth;
+      const th = this.tooltipEl.offsetHeight;
+      let top = rect.top - cRect.top - th - 8;
+      let left = rect.left - cRect.left;
+      if (top < 0) top = rect.bottom - cRect.top + 8;
+      left = Math.min(Math.max(4, left), cRect.width - tw - 4);
+      this.tooltipEl.style.top = `${top}px`;
+      this.tooltipEl.style.left = `${left}px`;
+      this.tooltipEl.style.visibility = "visible";
+    });
+    this.cmEditor.dom.addEventListener("mouseleave", () => {
+      this.tooltipEl.style.display = "none";
+    });
     this.wordCountEl = editorArea.createDiv("nr-wordcount");
     this.wordCountEl.setText("0 words");
     const legend = editorArea.createDiv("nr-legend");
@@ -5724,7 +5847,7 @@ var RecorderView = class extends import_obsidian.ItemView {
     closeBtn.setText("\u2715");
     closeBtn.addEventListener("click", () => this.closeSidebar());
     this.sidebarBodyEl = this.sidebarEl.createDiv("nr-sidebar-body");
-    const reviewPane = container.createDiv("nr-pane");
+    const reviewPane = paneSlider.createDiv("nr-pane");
     const reviewPanels = reviewPane.createDiv("nr-panels");
     const transcriptPanel = reviewPanels.createDiv("nr-panel");
     transcriptPanel.createEl("h3", { text: "Transcript", cls: "nr-panel-title" });
@@ -5737,7 +5860,7 @@ var RecorderView = class extends import_obsidian.ItemView {
     this.aiNotesStatusEl = aiPanel.createDiv("nr-ai-status");
     this.aiNotesEl = aiPanel.createDiv("nr-ai-notes");
     this.aiNotesEl.createEl("p", { text: "AI-generated notes will appear here after recording stops.", cls: "nr-placeholder" });
-    const quizPane = container.createDiv("nr-pane");
+    const quizPane = paneSlider.createDiv("nr-pane");
     const quizHeader = quizPane.createDiv("nr-quiz-header");
     quizHeader.createEl("h3", { text: "Quiz Yourself", cls: "nr-panel-title" });
     this.newQuestionsBtn = quizHeader.createEl("button", { text: "\u21BB New Questions", cls: "nr-new-questions-btn" });
@@ -5746,14 +5869,13 @@ var RecorderView = class extends import_obsidian.ItemView {
     this.quizStatusEl = quizPane.createDiv("nr-quiz-status");
     this.quizStatusEl.createEl("p", { text: "Record a lecture first, then come back here to quiz yourself.", cls: "nr-placeholder" });
     this.quizQuestionsEl = quizPane.createDiv("nr-quiz-questions");
-    const panes = [recordPane, reviewPane, quizPane];
     const tabs = [recordTab, reviewTab, quizTab];
     tabs.forEach((tab, i) => tab.addEventListener("click", () => {
       tabs.forEach((t, j) => t.toggleClass("nr-tab-active", j === i));
-      panes.forEach((p, j) => p.toggleClass("nr-pane-active", j === i));
+      paneSlider.style.transform = `translateX(-${i * (100 / 3)}%)`;
       if (i === 2 && this.transcript && this.quizQuestions.length === 0) this.generateQuestions();
     }));
-    const footer = container.createDiv("nr-footer");
+    const footer = main.createDiv("nr-footer");
     this.saveBtn = footer.createEl("button", { text: "Save to Vault", cls: "nr-save-btn" });
     this.saveBtn.disabled = true;
     this.saveBtn.addEventListener("click", () => this.saveToVault());
@@ -5785,16 +5907,18 @@ var RecorderView = class extends import_obsidian.ItemView {
     }
     const apiKey = this.plugin.settings.groqApiKey;
     if (!apiKey) {
-      this.showError("No Groq API key. Add it in Settings \u2192 NoteReal.");
+      this.showError("No Groq API key. Add it in Settings \u2192 Did You Even Listen.");
       return;
     }
+    const prevCount = this.feedbackItems.length;
+    const isRecheck = this.prevStudentNotes !== "";
     this.feedbackBtn.disabled = true;
     this.feedbackBtn.setText("Analyzing\u2026");
     this.clearHighlights();
     this.metacogSections = [];
     this.metacogGivenUpSections = /* @__PURE__ */ new Set();
     try {
-      const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
+      const raw = isRecheck ? await recheckFeedback(this.prevStudentNotes, studentNotes, this.generatedMarkdown, apiKey) : await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
       this.feedbackItems = raw.map((item, i) => {
         const id = `f${i}`;
         let from = 0, to = 0;
@@ -5807,9 +5931,25 @@ var RecorderView = class extends import_obsidian.ItemView {
         }
         return { ...item, id, from, to };
       });
+      this.prevStudentNotes = studentNotes;
       this.applyHighlights();
       const count2 = this.feedbackItems.filter((f) => f.from < f.to).length;
       new import_obsidian.Notice(`${count2} issue${count2 !== 1 ? "s" : ""} highlighted \u2014 click any underlined text to see feedback.`);
+      if (isRecheck) {
+        if (this.feedbackItems.length < prevCount) {
+          this.triggerBrainEvent("success", "Nice Change!");
+        } else {
+          this.triggerBrainEvent("fail", "YOU FAILED.");
+        }
+      } else {
+        if (count2 >= 5) {
+          this.brainScore--;
+          this.updateBrainImage();
+        } else if (count2 <= 2) {
+          this.brainScore++;
+          this.updateBrainImage();
+        }
+      }
       const legend = this.containerEl.querySelector("#nr-legend");
       if (legend) legend.style.display = "flex";
       if (this.mode === "metacognition") {
@@ -5827,7 +5967,7 @@ var RecorderView = class extends import_obsidian.ItemView {
   openFeedbackPopup(id) {
     const item = this.feedbackItems.find((f) => f.id === id);
     if (!item) return;
-    new FeedbackModal(this.app, item, this.plugin.settings.groqApiKey).open();
+    new FeedbackModal(this.app, item, this.plugin.settings.groqApiKey, () => this.triggerBrainEvent("fail")).open();
   }
   applyHighlights() {
     const highlights = this.feedbackItems.filter((item) => item.from < item.to).map(({ from, to, id, type }) => ({ from, to, id, type }));
@@ -5853,7 +5993,7 @@ var RecorderView = class extends import_obsidian.ItemView {
     }
     const apiKey = this.plugin.settings.groqApiKey;
     if (!apiKey) {
-      this.showError("No Groq API key. Add it in Settings \u2192 NoteReal.");
+      this.showError("No Groq API key. Add it in Settings \u2192 Did You Even Listen.");
       return;
     }
     this.mode = "metacognition";
@@ -5914,14 +6054,15 @@ var RecorderView = class extends import_obsidian.ItemView {
       text: "Rate how well YOU covered each topic, then compare with the AI.",
       cls: "nr-sidebar-intro"
     });
-    this.metacogSections.forEach((section, i) => {
+    const covered = this.metacogSections.map((s, i) => ({ s, i })).filter(({ s }) => !!s.studentExcerpt);
+    const missed = this.metacogSections.map((s, i) => ({ s, i })).filter(({ s }) => !s.studentExcerpt);
+    missed.forEach(({ i }) => {
+      this.metacogUserScores[i] = 1;
+    });
+    covered.forEach(({ s: section, i }) => {
       const card = this.sidebarBodyEl.createDiv("nr-metacog-card");
       card.createEl("h4", { text: section.title, cls: "nr-metacog-section-title" });
-      if (section.studentExcerpt) {
-        card.createEl("p", { text: `"${section.studentExcerpt}"`, cls: "nr-metacog-excerpt" });
-      } else {
-        card.createEl("p", { text: "Nothing written about this topic.", cls: "nr-placeholder" });
-      }
+      card.createEl("p", { text: `"${section.studentExcerpt}"`, cls: "nr-metacog-excerpt" });
       card.createEl("p", { text: "Your rating:", cls: "nr-metacog-rating-label" });
       const row = card.createDiv("nr-metacog-rating-row");
       for (let n = 1; n <= 10; n++) {
@@ -5929,15 +6070,21 @@ var RecorderView = class extends import_obsidian.ItemView {
         btn.addEventListener("click", () => {
           this.metacogUserScores[i] = n;
           row.querySelectorAll(".nr-rating-btn").forEach((b, bi) => b.toggleClass("nr-rating-selected", bi < n));
-          compareBtn.disabled = this.metacogUserScores.some((s) => s === 0);
+          compareBtn.disabled = covered.some(({ i: ci }) => this.metacogUserScores[ci] === 0);
         });
       }
     });
+    if (missed.length > 0) {
+      const missedBox = this.sidebarBodyEl.createDiv("nr-metacog-missed-box");
+      missedBox.createEl("p", { text: "Topics you didn't cover \u2014 add these to your notes:", cls: "nr-metacog-missed-label" });
+      const list = missedBox.createEl("ul", { cls: "nr-metacog-missed-list" });
+      missed.forEach(({ s }) => list.createEl("li", { text: s.title }));
+    }
     const compareBtn = this.sidebarBodyEl.createEl("button", {
       text: "Compare with AI \u2192",
       cls: "nr-metacog-compare-btn"
     });
-    compareBtn.disabled = true;
+    compareBtn.disabled = covered.some(({ i }) => this.metacogUserScores[i] === 0);
     compareBtn.addEventListener("click", () => this.runMetacognitionComparison(compareBtn));
   }
   async runMetacognitionComparison(compareBtn) {
@@ -5949,6 +6096,15 @@ var RecorderView = class extends import_obsidian.ItemView {
       feedback = await generateComparisonFeedback(this.metacogSections, this.feedbackItems, this.metacogUserScores, apiKey);
     } catch (e) {
       feedback = this.metacogSections.map(() => "Could not generate feedback.");
+    }
+    const overconfident = this.metacogSections.filter((s, i) => this.metacogUserScores[i] - s.aiScore > 2).length;
+    const total = this.metacogSections.length;
+    if (overconfident > total / 2) {
+      this.brainScore--;
+      this.updateBrainImage();
+    } else if (overconfident === 0 && total > 0) {
+      this.brainScore++;
+      this.updateBrainImage();
     }
     this.renderMetacognitionResults(feedback);
   }
@@ -5984,6 +6140,7 @@ var RecorderView = class extends import_obsidian.ItemView {
           giveUpBtn.style.display = "none";
           issuesWrap.style.display = "block";
           this.applyMetacogRevealedHighlights();
+          this.triggerBrainEvent("fail");
           const typeLabel = {
             incomplete: "Expand this",
             missing: "Add this concept",
@@ -6011,18 +6168,53 @@ var RecorderView = class extends import_obsidian.ItemView {
       }
     });
   }
+  updateBrainImage() {
+    const asset = this.brainScore <= -2 ? "roastedBrain.png" : this.brainScore >= 2 ? "galaxyBrain.png" : "neutralBrain.png";
+    this.headerBrainEl.src = this.app.vault.adapter.getResourcePath(
+      `${this.plugin.manifest.dir}/assets/${asset}`
+    );
+  }
+  triggerBrainEvent(type, message) {
+    const asset = type === "fail" ? "roastedBrain.png" : "galaxyBrain.png";
+    this.headerBrainEl.src = this.app.vault.adapter.getResourcePath(
+      `${this.plugin.manifest.dir}/assets/${asset}`
+    );
+    this.headerBrainEl.addClass("nr-brain-pop");
+    this.headerBrainEl.addEventListener("animationend", () => this.headerBrainEl.removeClass("nr-brain-pop"), { once: true });
+    const container = this.containerEl.children[1];
+    const overlay = container.createDiv(`nr-result-overlay nr-result-${type}`);
+    const brainSrc = this.app.vault.adapter.getResourcePath(
+      `${this.plugin.manifest.dir}/assets/${asset}`
+    );
+    overlay.createEl("img", { cls: "nr-result-brain", attr: { src: brainSrc, draggable: "false" } });
+    overlay.createEl("p", {
+      text: message != null ? message : type === "fail" ? "YOU FAILED." : "YOU SUCCEEDED!",
+      cls: "nr-result-title"
+    });
+    overlay.createEl("p", { text: "click to continue", cls: "nr-result-sub" });
+    requestAnimationFrame(() => overlay.addClass("nr-result-visible"));
+    const dismiss = () => {
+      overlay.removeClass("nr-result-visible");
+      overlay.addEventListener("transitionend", () => overlay.remove(), { once: true });
+    };
+    overlay.addEventListener("click", dismiss);
+    setTimeout(dismiss, 4e3);
+  }
   async recheckAll() {
     const studentNotes = this.cmEditor.state.doc.toString().trim();
     const apiKey = this.plugin.settings.groqApiKey;
     if (!studentNotes || !apiKey) return;
+    const prevCount = this.feedbackItems.length;
     this.feedbackItems = [];
     this.metacogSections = [];
     this.metacogGivenUpSections = /* @__PURE__ */ new Set();
+    this.brainScore = 0;
+    this.updateBrainImage();
     this.clearHighlights();
     this.sidebarBodyEl.empty();
     this.sidebarBodyEl.innerHTML = '<div class="nr-sidebar-loading"><span class="nr-spinner"></span><p>Running feedback analysis\u2026</p></div>';
     try {
-      const raw = await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
+      const raw = this.prevStudentNotes ? await recheckFeedback(this.prevStudentNotes, studentNotes, this.generatedMarkdown, apiKey) : await generateFeedback(studentNotes, this.generatedMarkdown, apiKey);
       this.feedbackItems = raw.map((item, i) => {
         const id = `f${i}`;
         let from = 0, to = 0;
@@ -6035,11 +6227,18 @@ var RecorderView = class extends import_obsidian.ItemView {
         }
         return { ...item, id, from, to };
       });
+      this.prevStudentNotes = studentNotes;
     } catch (e) {
       this.sidebarBodyEl.createEl("p", { text: `Recheck failed: ${e.message}`, cls: "nr-sidebar-error" });
       return;
     }
     await this.loadMetacognitionSections(studentNotes, apiKey);
+    const newCount = this.feedbackItems.length;
+    if (newCount < prevCount) {
+      this.triggerBrainEvent("success", "Nice Change!");
+    } else {
+      this.triggerBrainEvent("fail", "YOU FAILED.");
+    }
   }
   closeSidebar() {
     this.mode = "normal";
@@ -6108,6 +6307,7 @@ var RecorderView = class extends import_obsidian.ItemView {
       this.mediaRecorder.start();
       this.isRecording = true;
       this.recordBtn.addClass("nr-recording");
+      this.containerEl.children[1].addClass("nr-is-recording");
       this.recordBtn.innerHTML = '<span class="nr-dot"></span> Stop Recording';
       this.timerEl.style.display = "flex";
       this.timerInterval = window.setInterval(() => {
@@ -6120,6 +6320,7 @@ var RecorderView = class extends import_obsidian.ItemView {
   }
   async stopRecording() {
     this.isRecording = false;
+    this.containerEl.children[1].removeClass("nr-is-recording");
     if (this.mediaRecorder) {
       this.mediaRecorder.onstop = () => this.processRecording();
       this.mediaRecorder.stop();
@@ -6154,7 +6355,7 @@ var RecorderView = class extends import_obsidian.ItemView {
     }
     const apiKey = this.plugin.settings.groqApiKey;
     if (!apiKey) {
-      this.showError("No Groq API key. Add it in Settings \u2192 NoteReal.");
+      this.showError("No Groq API key. Add it in Settings \u2192 Did You Even Listen.");
       return;
     }
     this.aiNotesStatusEl.setText("Transcribing\u2026");
@@ -6332,20 +6533,20 @@ var DEFAULT_SETTINGS = {
   groqApiKey: "",
   saveFolder: ""
 };
-var NoteRealPlugin = class extends import_obsidian2.Plugin {
+var DidYouEvenListenPlugin = class extends import_obsidian2.Plugin {
   async onload() {
     await this.loadSettings();
     this.registerView(
       RECORDER_VIEW_TYPE,
       (leaf) => new RecorderView(leaf, this)
     );
-    this.addRibbonIcon("mic", "NoteReal", () => this.activateView());
+    this.addRibbonIcon("mic", "Did You Even Listen", () => this.activateView());
     this.addCommand({
-      id: "open-notereal",
-      name: "Open NoteReal recorder",
+      id: "open-didyouevenlisten",
+      name: "Open Did You Even Listen recorder",
       callback: () => this.activateView()
     });
-    this.addSettingTab(new NoteRealSettingTab(this.app, this));
+    this.addSettingTab(new DidYouEvenListenSettingTab(this.app, this));
   }
   onunload() {
     this.app.workspace.detachLeavesOfType(RECORDER_VIEW_TYPE);
@@ -6366,7 +6567,7 @@ var NoteRealPlugin = class extends import_obsidian2.Plugin {
     await this.saveData(this.settings);
   }
 };
-var NoteRealSettingTab = class extends import_obsidian2.PluginSettingTab {
+var DidYouEvenListenSettingTab = class extends import_obsidian2.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;

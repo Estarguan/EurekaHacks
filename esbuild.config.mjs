@@ -4,8 +4,8 @@ import builtins from "builtin-modules";
 import fs from "fs";
 
 const VAULT_PATHS = [
-  "C:/Users/aweso/OneDrive/Desktop/EurekaHacks1/.obsidian/plugins/notereal",
-  "/Users/estarguan/Documents/Eureka/.obsidian/plugins/notereal",
+  "C:/Users/aweso/OneDrive/Desktop/EurekaHacks1/.obsidian/plugins/didyouevenlisten",
+  "/Users/estarguan/Documents/Eureka/.obsidian/plugins/didyouevenlisten",
 ];
 
 function copyDirRecursive(src, dest) {
@@ -24,6 +24,7 @@ function syncToVault() {
     if (fs.existsSync(vault)) {
       fs.copyFileSync("main.js", `${vault}/main.js`);
       fs.copyFileSync("styles.css", `${vault}/styles.css`);
+      fs.copyFileSync("manifest.json", `${vault}/manifest.json`);
       copyDirRecursive("src/assets", `${vault}/assets`);
       console.log(`[sync] → ${vault}`);
     }

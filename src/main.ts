@@ -1,18 +1,18 @@
 import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
 import { RecorderView, RECORDER_VIEW_TYPE } from "./recorder-view";
 
-export interface NoteRealSettings {
+export interface DidYouEvenListenSettings {
 	groqApiKey: string;
 	saveFolder: string;
 }
 
-const DEFAULT_SETTINGS: NoteRealSettings = {
+const DEFAULT_SETTINGS: DidYouEvenListenSettings = {
 	groqApiKey: "",
 	saveFolder: "",
 };
 
-export default class NoteRealPlugin extends Plugin {
-	settings!: NoteRealSettings;
+export default class DidYouEvenListenPlugin extends Plugin {
+	settings!: DidYouEvenListenSettings;
 
 	async onload() {
 		await this.loadSettings();
@@ -22,15 +22,15 @@ export default class NoteRealPlugin extends Plugin {
 			(leaf) => new RecorderView(leaf, this)
 		);
 
-		this.addRibbonIcon("mic", "NoteReal", () => this.activateView());
+		this.addRibbonIcon("mic", "Did You Even Listen", () => this.activateView());
 
 		this.addCommand({
-			id: "open-notereal",
-			name: "Open NoteReal recorder",
+			id: "open-didyouevenlisten",
+			name: "Open Did You Even Listen recorder",
 			callback: () => this.activateView(),
 		});
 
-		this.addSettingTab(new NoteRealSettingTab(this.app, this));
+		this.addSettingTab(new DidYouEvenListenSettingTab(this.app, this));
 	}
 
 	onunload() {
@@ -56,10 +56,10 @@ export default class NoteRealPlugin extends Plugin {
 	}
 }
 
-class NoteRealSettingTab extends PluginSettingTab {
-	plugin: NoteRealPlugin;
+class DidYouEvenListenSettingTab extends PluginSettingTab {
+	plugin: DidYouEvenListenPlugin;
 
-	constructor(app: App, plugin: NoteRealPlugin) {
+	constructor(app: App, plugin: DidYouEvenListenPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
